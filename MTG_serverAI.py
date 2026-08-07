@@ -6,6 +6,8 @@ import threading
 import time
 import random
 
+from card_catalog import load_card_catalog
+
 MAX_PDU_SIZE = 65535
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4444
@@ -59,7 +61,12 @@ class MTGNPServer:
         self.server_seq_num = 1
         self.seq_lock = threading.Lock()
         
-        self.card_catalog = set()  # Set to None or populate with allowed card IDs
+        try:
+            self.card_catalog, self.base_cards = load_card_catalog("mtgnp_master_card_list.xlsx")
+            print(f"[SERVER] Loaded {len(self.card_catalog)} valid card instances and {len(self.base_cards)} base cards.")
+        except Exception as e:
+            print(f"[SERVER WARNING] Failed to load card catalog: {e}")
+            self.card_catalog, self.base_cards = set(), {}  # Set to None or populate with allowed card IDs
         self.state = "LOBBY"       # LOBBY, IN_GAME, GAME_OVER
         self.players = []          # [{"id": "player_1", "socket": sock, "addr": addr}]
         self.ready_players = {}    # Maps conn_id -> {"player_id": str, "deck_list": list}
