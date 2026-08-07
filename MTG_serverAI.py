@@ -11,6 +11,12 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4444
 DEFAULT_PRIORITY_TIMEOUT_MS = 60000
 
+PHASE_SEQUENCES = [
+    "UNTAP", "UPKEEP", "DRAW", "PRECOMBAT_MAIN", 
+    "BEGIN_COMBAT", "DECLARE_ATTACKERS", "DECLARE_BLOCKERS", "ASSIGN_DAMAGE_ORDER", "COMBAT_DAMAGE", "END_OF_COMBAT", 
+    "POSTCOMBAT_MAIN", "END_STEP", "CLEANUP"
+]
+
 def send_pdu(sock: socket.socket, payload: dict) -> None:
     """Encodes JSON payload and prefixes it with a 4-byte big-endian header."""
     json_bytes = json.dumps(payload).encode('utf-8')
