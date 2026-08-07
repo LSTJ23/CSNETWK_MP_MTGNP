@@ -230,7 +230,7 @@ class MTGNPServer:
             "libraries": {p1_id: p1_library, p2_id: p2_library},
             "battlefield": {p1_id: [], p2_id: []},
             "graveyard": {p1_id: [], p2_id: []},
-            "stack": []
+            "stack": [],
             "land_cast_on_turn": False
         }
 
