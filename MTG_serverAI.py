@@ -241,6 +241,12 @@ class MTGNPServer:
             "land_cast_on_turn": False
         }
 
+        self.mulligan_state = {
+            p1_id: {"kept": False, "count": 0},
+            p2_id: {"kept": False, "count": 0}
+        }
+        self.state = "MULLIGAN"
+
         self.state = "IN_GAME"
         for p in self.players:
             self.send_game_state_update(p)
