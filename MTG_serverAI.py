@@ -231,6 +231,7 @@ class MTGNPServer:
             "battlefield": {p1_id: [], p2_id: []},
             "graveyard": {p1_id: [], p2_id: []},
             "stack": []
+            "land_cast_on_turn": False
         }
 
         self.state = "IN_GAME"
