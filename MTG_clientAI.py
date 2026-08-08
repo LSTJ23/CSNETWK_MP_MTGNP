@@ -11,6 +11,31 @@ DEFAULT_PORT = 4444
 PING_INTERVAL_SEC = 30.0
 PONG_TIMEOUT_SEC = 10.0
 
+def generate_test_deck():
+    """
+    Generates a valid 60-card test deck array matching mtgnp_master_card_list.xlsx:
+    - 20 Mountains (mountain_001 to mountain_020)
+    - 20 Forests (forest_001 to forest_020)
+    - 5 sets of 4-copy spells (20 cards total)
+    """
+    deck = []
+    
+    # 20 Basic Lands (Mountains)
+    for i in range(1, 21):
+        deck.append(f"mountain_{i:03d}")
+        
+    # 20 Basic Lands (Forests)
+    for i in range(1, 21):
+        deck.append(f"forest_{i:03d}")
+        
+    # 20 Spells/Creatures (4 copies each of 5 cards)
+    spells = ["lightning_bolt", "giant_growth", "shock", "counterspell", "dark_ritual"]
+    for spell in spells:
+        for i in range(1, 5):
+            deck.append(f"{spell}_{i:03d}")
+            
+    return deck
+
 def send_pdu(sock: socket.socket, payload: dict) -> None:
     json_bytes = json.dumps(payload).encode('utf-8')
     if len(json_bytes) > MAX_PDU_SIZE:
@@ -225,8 +250,11 @@ class MTGNPClient:
                         continue
                     
                     p_id = parts[1]
-                    cards = parts[2].split(",") if len(parts) > 2 else ["lightning_bolt_001", "shock_001"]
-                    cards = [c.strip() for c in cards if c.strip()]
+                    
+                    if len(parts) > 2:
+                        cards = [c.strip() for c in parts[2].split(",") if c.strip()]
+                    else:
+                        cards = generate_test_deck()
                     
                     self.send_player_ready(p_id, cards)
                     print(f"[CLIENT] Sent PLAYER_READY for '{p_id}' with {len(cards)} cards.")

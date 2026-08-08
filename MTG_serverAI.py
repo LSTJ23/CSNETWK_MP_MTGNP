@@ -79,7 +79,80 @@ class MTGNPServer:
         
         self.rematch_votes = {}
         self.reset_game_state()
+        
+        self.engine = GameEngine(self.game_state, self.base_cards)
 
+    def validate_deck(self, deck_list):
+        """Validates deck size and card legality."""
+        if not isinstance(deck_list, list) or len(deck_list) != 60:
+            return False, f"Invalid deck size: expected 60 cards, got {len(deck_list) if isinstance(deck_list, list) else 'invalid format'}"
+        
+        for card_id in deck_list:
+            if card_id not in self.card_catalog:
+                return False, f"Invalid card_id in deck: '{card_id}' is not in the master catalog."
+                
+        return True, "Deck valid"
+    
+    def handle_player_ready(self, player_info: dict, pdu: dict):
+        """Validates deck size and player ID uniqueness before marking player ready."""
+        sock = player_info["socket"]
+        conn_id = player_info["id"]
+        
+        player_id = str(pdu.get("player_id", "")).strip()
+        deck_list = pdu.get("deck_list", [])
+
+        # Call the validation method
+        is_valid, reason = self.validate_deck(deck_list)
+        if not is_valid:
+            print(f"[SERVER] Deck validation failed for {player_id}: {reason}")
+            send_pdu(sock, {
+                "type": "ERROR",
+                "seq_num": self.get_next_seq(),
+                "code": "ILLEGAL_DECK",
+                "message": f"PLAYER_READY rejected: {reason}"
+            })
+            return
+
+        # If valid, proceed with saving the player state
+        with self.lock:
+            self.ready_players[conn_id] = {
+                "player_id": player_id,
+                "deck": list(deck_list),
+                "hand": [],
+                "battlefield": [],
+                "graveyard": [],
+                "life": 20
+            }
+            print(f"[SERVER] Player {player_id} submitted a valid 60-card deck and is ready.")
+            
+    def check_win_conditions(self):
+        """
+        Checks game-ending conditions according to RFC rules:
+        1. Player life <= 0 (Loss)
+        2. Player library/deck is empty when attempting to draw (Deckout Loss)
+        """
+        if len(self.ready_players) < 2:
+            return False, None, ""
+
+        players = list(self.ready_players.values())
+        p1, p2 = players[0], players[1]
+
+        # 1. Life total checks
+        if p1["life"] <= 0 and p2["life"] <= 0:
+            return True, "DRAW", "Both players hit 0 life simultaneously."
+        elif p1["life"] <= 0:
+            return True, p2["player_id"], f"Player {p1['player_id']} reached 0 life."
+        elif p2["life"] <= 0:
+            return True, p1["player_id"], f"Player {p2['player_id']} reached 0 life."
+
+        # 2. Empty library checks (Deckout)
+        if len(p1["deck"]) == 0 and len(p1["hand"]) == 0 and len(p1["battlefield"]) == 0:
+            return True, p2["player_id"], f"Player {p1['player_id']} has no remaining cards to play or draw."
+        if len(p2["deck"]) == 0 and len(p2["hand"]) == 0 and len(p2["battlefield"]) == 0:
+            return True, p1["player_id"], f"Player {p2['player_id']} has no remaining cards to play or draw."
+
+        return False, None, ""         
+            
     def reset_to_lobby(self):
         """Resets game state back to LOBBY while retaining TCP connections."""
         if self.priority_timer:
@@ -101,6 +174,8 @@ class MTGNPServer:
         }
         self.consecutive_passes = 0
         self.rematch_votes.clear()
+        if hasattr(self, 'engine'):
+            self.engine.game_state = self.game_state
 
     def get_next_seq(self) -> int:
         with self.seq_lock:
@@ -166,12 +241,12 @@ class MTGNPServer:
                 })
                 return
 
-        if len(deck_list) < 1 or len(deck_list) > 50:
+        if len(deck_list) < 1 or len(deck_list) != 60:
             send_pdu(sock, {
                 "type": "ERROR",
                 "seq_num": self.get_next_seq(),
                 "code": "ILLEGAL_DECK",
-                "message": f"Deck must contain between 1 and 50 cards; got {len(deck_list)}."
+                "message": f"Deck must contain between 1 and 60 cards; got {len(deck_list)}."
             })
             return
 
@@ -229,8 +304,9 @@ class MTGNPServer:
         starting_player = random.choice([p1_id, p2_id])
 
         self.game_state = {
-            "turn": 0,
-            "phase": "MULLIGAN",
+            "turn": 1,
+            "phase": "PRECOMBAT_MAIN",
+            "step": "MAIN",
             "active_player": starting_player,
             "life_totals": {p1_id: 20, p2_id: 20},
             "hands": {p1_id: p1_hand, p2_id: p2_hand},
@@ -240,14 +316,14 @@ class MTGNPServer:
             "stack": [],
             "land_cast_on_turn": False
         }
+        self.engine.game_state = self.game_state
 
         self.mulligan_state = {
-            p1_id: {"kept": False, "count": 0},
-            p2_id: {"kept": False, "count": 0}
+            p1_id: {"kept": True, "count": 0},
+            p2_id: {"kept": True, "count": 0}
         }
-        self.state = "MULLIGAN"
-
         self.state = "IN_GAME"
+
         for p in self.players:
             self.send_game_state_update(p)
 
@@ -474,15 +550,62 @@ class MTGNPServer:
 
                     if pdu_type == "PRIORITY_PASS":
                         self.consecutive_passes += 1
+                        
                         if self.consecutive_passes >= 2:
-                            self.transition_phase("COMBAT", "DECLARE_ATTACKERS")
+                            self.consecutive_passes = 0
+                            
+                            # 1. If stack has spells, resolve the top item first
+                            if self.game_state["stack"]:
+                                resolved_item = self.engine.resolve_stack()
+                                print(f"[SERVER] Resolved stack object: {resolved_item}")
+                                
+                                for p in self.players:
+                                    self.send_game_state_update(p)
+                                
+                                self.grant_priority(self.game_state["active_player"])
+                            else:
+                                # 2. If stack is empty, transition to COMBAT
+                                self.transition_phase("COMBAT", "DECLARE_ATTACKERS")
                         else:
                             all_pids = [r["player_id"] for r in self.ready_players.values()]
                             next_player = next(p for p in all_pids if p != current_pid)
                             self.grant_priority(next_player)
 
                     elif pdu_type == "CAST_SPELL":
-                        self.game_state["stack"].append(pdu.get("card_id"))
+                        card_id = pdu.get("card_id")
+                        
+                        # 1. Determine if card is a Land or Spell
+                        base_card_name = "_".join(card_id.split("_")[:-1]) if card_id else ""
+                        card_info = self.base_cards.get(base_card_name, {})
+                        card_type = str(card_info.get("type", "")).upper()
+                        
+                        is_land = card_type == "LAND" or base_card_name in ["mountain", "forest", "island", "swamp", "plains"]
+
+                        # 2. Process Land vs Spell using GameEngine
+                        if is_land:
+                            success = self.engine.play_land(current_pid, card_id)
+                            if not success:
+                                send_pdu(sock, {
+                                    "type": "ERROR",
+                                    "seq_num": self.get_next_seq(),
+                                    "code": "ILLEGAL_ACTION",
+                                    "message": f"Cannot play land '{card_id}' (not in hand or land already played this turn)."
+                                })
+                                self.grant_priority(current_pid)
+                                continue
+                        else:
+                            success = self.engine.cast_spell(current_pid, card_id)
+                            if not success:
+                                send_pdu(sock, {
+                                    "type": "ERROR",
+                                    "seq_num": self.get_next_seq(),
+                                    "code": "ILLEGAL_ACTION",
+                                    "message": f"Cannot cast spell '{card_id}' (not in hand)."
+                                })
+                                self.grant_priority(current_pid)
+                                continue
+
+                        # 3. Broadcast updated game state and pass priority back
                         self.consecutive_passes = 0
                         for p in self.players:
                             self.send_game_state_update(p)
@@ -547,9 +670,12 @@ class GameEngine:
         if card_id not in hand:
             return False
 
+        # Extract base card name (e.g. 'mountain_001' -> 'mountain')
+        base_card_name = "_".join(card_id.split("_")[:-1]) if card_id else ""
+        card = self.card_catalog.get(base_card_name, {})
+        
         # check if the card is a land card
-        card = self.card_catalog[card_id]
-        if card["type"] != "LAND":
+        if card.get("type", "").upper() != "LAND" and base_card_name not in ["mountain", "forest", "island", "swamp", "plains"]:
             return False
 
         # check if the player has already played a land this turn
@@ -594,52 +720,81 @@ class GameEngine:
 
         return True
 
-    # [TO BE BUILT] stack resolution function
+    # Resolves spells on the stack, applies card effects, and moves cards to the graveyard
     def resolve_stack(self):
-        """Resolves the top spell on the stack."""
+        """Resolves the top spell on the stack and applies its card effect."""
         if not self.game_state["stack"]:
             print("[GAME ENGINE] Stack is empty; nothing to resolve.")
             return None
-        top_spell = self.game_state["stack"].pop()
-        # Logic to apply the effect of the spell can be implemented here
-        print(f"[GAME ENGINE] Resolved spell: {top_spell}")
-        return top_spell
 
-    # getter for game state
-    def get_game_state(self):
-        """Returns a copy of the current game state."""
-        return json.loads(json.dumps(self.game_state))  # Deep copy for safety
-
-    # setter for game state
-    def set_game_state(self, new_state):
-        """Sets the game state to a new state."""
-        self.game_state = new_state
-        print("[GAME ENGINE] Game state updated.")
-
-    # end turn function
-    def end_turn(self):
-
-        # find active player
-        current = self.game_state["active_player"]
-
-        # if active player is player_1, set active player to player_2, else set to player_1
-        if current == server.p1_id:
-            self.game_state["active_player"] = server.p2_id
+        # Pop top spell off the FILO stack
+        top_item = self.game_state["stack"].pop()
+        
+        # Determine controller and card_id
+        if isinstance(top_item, dict):
+            controller = top_item.get("controller")
+            card_id = top_item.get("card")
         else:
-            self.game_state["active_player"] = server.p1_id
+            controller = self.game_state.get("active_player")
+            card_id = top_item
 
-        self.game_state["turn"] += 1
+        base_card_name = "_".join(card_id.split("_")[:-1]) if card_id else ""
 
-        print(f"[GAME ENGINE] Turn ended. Next active player: {self.game_state['active_player']}. Turn number: {self.game_state['turn']}.")
+        # Identify opponent ID
+        all_pids = list(self.game_state["life_totals"].keys())
+        opponent = next((p for p in all_pids if p != controller), None)
+
+        print(f"[GAME ENGINE] Resolving '{card_id}' cast by {controller}...")
+
+        # --- CARD RESOLUTION EFFECTS ---
+        
+        # 1. Direct Damage Spells
+        if base_card_name in ["lightning_bolt", "shock"]:
+            damage = 3 if base_card_name == "lightning_bolt" else 2
+            if opponent:
+                self.game_state["life_totals"][opponent] -= damage
+                print(f"[GAME ENGINE] {base_card_name.upper()} dealt {damage} damage to {opponent}. Life remaining: {self.game_state['life_totals'][opponent]}")
+
+        # 2. Counterspell (Target top spell beneath it on stack)
+        elif base_card_name == "counterspell":
+            if self.game_state["stack"]:
+                countered = self.game_state["stack"].pop()
+                
+                if isinstance(countered, dict):
+                    countered_card = countered.get("card")
+                    countered_controller = countered.get("controller", opponent)
+                else:
+                    countered_card = countered
+                    countered_controller = opponent
+                
+                # Move countered spell to its controller's graveyard
+                if countered_controller and countered_card:
+                    self.game_state["graveyard"][countered_controller].append(countered_card)
+                print(f"[GAME ENGINE] COUNTERSPELL countered '{countered_card}'!")
+            else:
+                print(f"[GAME ENGINE] COUNTERSPELL fizzled (no target spell on stack).")
+
+        # 3. Utility / Buff Spells
+        elif base_card_name == "giant_growth":
+            print(f"[GAME ENGINE] GIANT GROWTH resolved for {controller}. Target creature gains +3/+3 until end of turn.")
+
+        elif base_card_name == "dark_ritual":
+            print(f"[GAME ENGINE] DARK RITUAL resolved for {controller}. Added 3 Black Mana to mana pool.")
+
+        # --- CLEANUP: Move the resolved spell (e.g. Counterspell/Lightning Bolt) to Graveyard ---
+        if controller and card_id:
+            self.game_state["graveyard"][controller].append(card_id)
+
+        return top_item
 
     def untap_step(self, player_id):
         """Handles the untap step for the given player."""
         battlefield = self.game_state["battlefield"][player_id]
         for permanent in battlefield:
-            permanent["tapped"] = False
+            if isinstance(permanent, dict):
+                permanent["tapped"] = False
         print(f"[GAME ENGINE] Untap step completed for {player_id}. All permanents untapped.")
         
-
 if __name__ == "__main__":
     server = MTGNPServer()
     server.start()
