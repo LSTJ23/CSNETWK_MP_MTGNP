@@ -501,6 +501,145 @@ class MTGNPServer:
                     pass
                 print(f"[SERVER] Cleaned up session for {pid}. Active connections: {len(self.players)}", flush=True)
 
+class GameEngine:
+
+    # initialize game engine with game state and card catalog
+    def __init__(self, game_state, card_catalog):
+        """
+        game_state:
+            The server's authoritative game state.
+
+        card_catalog:
+            Dictionary containing all card information.
+        """
+
+        self.game_state = game_state
+        self.card_catalog = card_catalog
+
+    # draw a card from the player's library to their hand
+    def draw_card(self, player_id):
+
+        # initialize the library for the player if it doesn't exist
+        library = self.game_state["libraries"][player_id]
+
+        # check if the library is empty
+        if len(library) == 0:
+            return False
+
+        # draw the top card from the library and add it to the player's hand
+        card = library.pop(0)
+
+        # add the drawn card to the player's hand
+        self.game_state["hands"][player_id].append(card)
+
+        return True
+
+    # play a land card from the player's hand to the battlefield
+    def play_land(self, player_id, card_id):
+
+        # player hand
+        hand = self.game_state["hands"][player_id]
+
+        # battlefield
+        battlefield = self.game_state["battlefield"][player_id]
+
+        # check if the card is in the player's hand in the first place
+        if card_id not in hand:
+            return False
+
+        # check if the card is a land card
+        card = self.card_catalog[card_id]
+        if card["type"] != "LAND":
+            return False
+
+        # check if the player has already played a land this turn
+        if self.game_state["land_cast_on_turn"]:
+            return False
+
+        # remove from hand and add to battlefield
+        hand.remove(card_id)
+
+        # add to battlefield with tapped status
+        battlefield.append({
+
+            "card": card_id,
+
+            "tapped": False
+        })
+
+        # mark that the player has played a land this turn
+        self.game_state["land_cast_on_turn"] = True
+
+        return True
+
+    # cast a spell from the player's hand to the stack
+    def cast_spell(self, player_id, card_id):
+
+        # player hand
+        hand = self.game_state["hands"][player_id]
+
+        # check if the card is in the player's hand
+        if card_id not in hand:
+            return False
+
+        # remove from hand and add to stack
+        hand.remove(card_id)
+
+        self.game_state["stack"].append({
+
+            "controller": player_id,
+
+            "card": card_id
+        })
+
+        return True
+
+    # [TO BE BUILT] stack resolution function
+    def resolve_stack(self):
+        """Resolves the top spell on the stack."""
+        if not self.game_state["stack"]:
+            print("[GAME ENGINE] Stack is empty; nothing to resolve.")
+            return None
+        top_spell = self.game_state["stack"].pop()
+        # Logic to apply the effect of the spell can be implemented here
+        print(f"[GAME ENGINE] Resolved spell: {top_spell}")
+        return top_spell
+
+    # getter for game state
+    def get_game_state(self):
+        """Returns a copy of the current game state."""
+        return json.loads(json.dumps(self.game_state))  # Deep copy for safety
+
+    # setter for game state
+    def set_game_state(self, new_state):
+        """Sets the game state to a new state."""
+        self.game_state = new_state
+        print("[GAME ENGINE] Game state updated.")
+
+    # end turn function
+    def end_turn(self):
+
+        # find active player
+        current = self.game_state["active_player"]
+
+        # if active player is player_1, set active player to player_2, else set to player_1
+        if current == server.p1_id:
+            self.game_state["active_player"] = server.p2_id
+        else:
+            self.game_state["active_player"] = server.p1_id
+
+        self.game_state["turn"] += 1
+
+        print(f"[GAME ENGINE] Turn ended. Next active player: {self.game_state['active_player']}. Turn number: {self.game_state['turn']}.")
+
+    def untap_step(self, player_id):
+        """Handles the untap step for the given player."""
+        battlefield = self.game_state["battlefield"][player_id]
+        for permanent in battlefield:
+            permanent["tapped"] = False
+        print(f"[GAME ENGINE] Untap step completed for {player_id}. All permanents untapped.")
+        
+
 if __name__ == "__main__":
     server = MTGNPServer()
     server.start()
