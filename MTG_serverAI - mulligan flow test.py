@@ -306,7 +306,7 @@ class MTGNPServer:
         starting_player = random.choice([p1_id, p2_id])
 
         self.game_state = {
-            "turn": 0,
+            "turn": 1,
             "phase": "MULLIGAN",
             "step": "MAIN",
             "active_player": starting_player,
@@ -425,7 +425,6 @@ class MTGNPServer:
         
         for p in self.players:
             self.send_game_state_update(p)
-        
         
         self.broadcast({
             "type": "PHASE_TRANSITION",
