@@ -129,7 +129,8 @@ class MTGNPClient:
                         # If mulligan, update current_priority_seq to echo seq_num
                         if state_data.get("phase") == "MULLIGAN":
                             self.current_priority_seq = seq_num
-                        self.render_visible_state()
+                            self.render_visible_state()
+                            print("\n[MULLIGAN] Hand redrawn. Type 'mulligan' to draw again, or 'keep' to keep.")
 
             elif msg_type == "PRIORITY_GRANT":
                 with self.lock:
@@ -255,7 +256,7 @@ class MTGNPClient:
                         send_pdu(self.sock, pdu)
                         print("[CLIENT] Taking mulligan...")
                     else:
-                        print("Mulligan phase. Type either 'keep (put number of cards depending on mulligan count)' or 'mulligan': ", end="", flush=True)
+                        print("Mulligan phase. Type either 'keep (put cards depending on mulligan count)' or 'mulligan': ", end="", flush=True)
                     continue
 
                 if cmd.lower().startswith("ready"):
