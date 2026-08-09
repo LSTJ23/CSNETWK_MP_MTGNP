@@ -306,7 +306,7 @@ class MTGNPServer:
         starting_player = random.choice([p1_id, p2_id])
 
         self.game_state = {
-            "turn": 1,
+            "turn": 0,
             "phase": "MULLIGAN",
             "step": "MAIN",
             "active_player": starting_player,
