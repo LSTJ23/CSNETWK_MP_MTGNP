@@ -929,7 +929,322 @@ class GameEngine:
             if isinstance(permanent, dict):
                 permanent["tapped"] = False
         print(f"[GAME ENGINE] Untap step completed for {player_id}. All permanents untapped.")
+
+    def resolve_creature(self, stack_item):
+        """Resolves a creature spell from the stack and places it onto the battlefield."""
+
+        player_id = stack_item["controller"]
+        card_id = stack_item["card"]
+
+        card = self.card_catalog.get(card_id)
+
+        if not card or card.get("type", "").upper() != "CREATURE":
+            print(f"[GAME ENGINE] Cannot resolve '{card_id}': Not a creature.")
+            return False
+
+        self.game_state["battlefield"][player_id].append({
+            "card": card_id,
+            "tapped": False,
+            "damage": 0,
+            "power": card.get("power", 0), # .get("power", 0) to handle missing power. card["power"] would raise KeyError if missing
+            "toughness": card.get("toughness", 0),
+            "summoning_sickness": True
+        })
+
+        return True
+
+    def declare_attackers(self, player_id, attackers):
+        """Handles the declaration of attackers for the given player."""
+
+        if self.game_state["phase"] != "DECLARE_ATTACKERS":
+            return False
         
+        if player_id != self.game_state["active_player"]:
+            return False
+        
+        battlefield = self.game_state["battlefield"][player_id]
+
+        valid_attackers = [perm for perm in battlefield if perm["card"] in attackers 
+                           and not perm.get("tapped", False) 
+                           and not perm.get("summoning_sickness", False)]
+
+        # if the number of valid attackers does not match the number of declared attackers, reject the action
+        # valid attackers are those that are untapped and do not have summoning sickness
+        # valid attackers must not equal the number of declared attackers, 
+        # otherwise it means some declared attackers are invalid because they are either tapped or have summoning sickness
+        if len(valid_attackers) != len(attackers):
+            print(f"[GAME ENGINE] Invalid attackers declared by {player_id}.")
+            return False
+
+        for perm in valid_attackers:
+            perm["tapped"] = True
+
+        self.game_state["combat"]["attackers"] = [perm["card"] for perm in valid_attackers]
+        print(f"[GAME ENGINE] {player_id} declared attackers: {[perm['card'] for perm in valid_attackers]}")
+        return True
+
+    def declare_blockers(self, player_id, blockers):
+        """Handles the declaration of blockers for the given player."""
+
+        if self.game_state["phase"] != "DECLARE_BLOCKERS":
+            return False
+        
+        all_pids = list(self.game_state["life_totals"].keys())
+        opponent = next((p for p in all_pids if p != player_id), None)
+
+        if not opponent:
+            return False
+
+        battlefield = self.game_state["battlefield"][player_id]
+        attackers = self.game_state["combat"]["attackers"]
+
+        # Keep track of which blockers have already been assigned to ensure no duplicates
+        used_blockers = set()
+
+        for declaration in blockers:
+            blocker_card = declaration.get("blocker")
+            attacker_card = declaration.get("attacker")
+
+            # Validate that the blocker is on the battlefield and not tapped
+            valid_blocker = next((perm for perm in battlefield if perm["card"] == blocker_card and not perm.get("tapped", False)), None)
+            if not valid_blocker:
+                print(f"[GAME ENGINE] Invalid blocker '{blocker_card}' declared by {player_id}. Not on battlefield or tapped.")
+                return False
+
+            # Validate that the attacker is among the declared attackers
+            valid_attacker = next((perm for perm in attackers if perm["card"] == attacker_card), None)
+            if not valid_attacker:
+                print(f"[GAME ENGINE] Invalid attacker '{attacker_card}' declared by {player_id}. Not among declared attackers.")
+                return False
+
+            # Ensure each blocker is only assigned to one attacker
+            if blocker_card in used_blockers:
+                print(f"[GAME ENGINE] Invalid blockers declared by {player_id}. Duplicate blocker '{blocker_card}' detected.")
+                return False
+
+            used_blockers.add(blocker_card)
+
+        self.game_state["combat"]["blockers"][player_id] = [{"blocker": decl["blocker"], "attacker": decl["attacker"]} for decl in blockers]
+        print(f"[GAME ENGINE] {player_id} declared blockers: {blockers}")
+
+        return True
+
+    def assign_damage_order(self, player_id, damage_order):
+        """Handles the assignment of damage order for the given player."""
+
+        if self.game_state["phase"] != "ASSIGN_DAMAGE_ORDER":
+            return False
+        
+        all_pids = list(self.game_state["life_totals"].keys())
+        defending_player = next((p for p in all_pids if p != player_id), None)
+
+        if not defending_player:
+            return False
+
+        if player_id not in self.game_state["combat"]["blockers"]:
+            print(f"[GAME ENGINE] {player_id} has not declared blockers yet.")
+            return False
+
+        if player_id != self.game_state["active_player"]:
+            print(f"[GAME ENGINE] {player_id} is not the active player and cannot assign damage order.")
+            return False
+
+        blockers = self.game_state["combat"]["blockers"].get(defending_player, [])
+
+        if not blockers:
+            print(f"[GAME ENGINE] No blockers declared by {defending_player}. Cannot assign damage order.")
+            return True
+
+        damage_order = {}
+
+        for declaration in blockers:
+
+            attacker_card = declaration.get("attacker")
+            blocker_card = declaration.get("blocker")
+
+            if attacker_card is None or blocker_card is None:
+                print(f"[GAME ENGINE] Invalid blocker declaration: {declaration}")
+                return False
+
+            # Get the list of blockers assigned to this attacker
+            actual_blockers = [b["blocker"] for b in blockers if b["attacker"] == attacker_card]
+
+            # Make sure the submitted blockers are exactly the same as the actual blockers for this attacker
+            if set(blocker_card.get(attacker_card, [])) != set(actual_blockers):
+                print(f"[GAME ENGINE] Damage order mismatch for attacker '{attacker_card}'. Expected blockers: {actual_blockers}, got: {blocker_card.get(attacker_card, [])}")
+                return False
+
+            # blockers.get() returns a list of blockers for the given attacker, or an empty list if none exist
+            damage_order[attacker_card] = blockers.get(attacker_card, []) + [blocker_card]
+
+        # attackers_with_multiple_blockers = [attacker for attacker, assigned_blockers in damage_order.items() if len(assigned_blockers) > 1]
+
+        # for block in blockers:
+        #     attacker_card = block.get("attacker")
+
+        #     if attacker_card not in attackers_with_multiple_blockers:
+        #         damage_order[attacker_card] = [block.get("blocker")]
+
+        #     attackers_with_multiple_blockers
+
+        self.game_state["combat"]["damage_order"] = damage_order
+        print(f"[GAME ENGINE] {player_id} assigned damage order: {damage_order}")
+
+        return True
+
+    def resolve_combat_damage(self):
+        """Resolves combat damage based on declared attackers, blockers, and assigned damage order."""
+
+        all_pids = list(self.game_state["life_totals"].keys())
+        active_player = self.game_state["active_player"]
+        defending_player = next((p for p in all_pids if p != active_player), None)
+
+        if not defending_player:
+            print("[GAME ENGINE] No defending player found. Cannot resolve combat.")
+            return False
+        
+        attackers = self.game_state["combat"]["attackers"]
+        blockers = self.game_state["combat"]["blockers"].get(defending_player, [])
+        damage_order = self.game_state["combat"].get("damage_order", {})
+
+        damage_events = []
+
+        # 1) Resolve damage for each attacker based on assigned blockers and damage order
+        for attacker in attackers:
+            attacker_card = attacker["card"]
+
+            power = attacker.get("power", 0)
+
+            assigned_blockers = [b["blocker"] for b in blockers if b["attacker"] == attacker_card]
+
+            # No blockers; damage goes to defending player
+            if not assigned_blockers:
+                self.game_state["life_totals"][defending_player] -= power
+                damage_events.append({
+                    "source": attacker_card,
+                    "target": defending_player,
+                    "controller": active_player,
+                    "amount": power
+                })
+
+                continue
+            # With Blockers; damage is assigned to blockers in the specified order
+            ordered_blockers = damage_order.get(attacker_card, assigned_blockers)
+
+            remaining_power = power
+
+            for blocker_card in ordered_blockers:
+                # Find the blocker permanent on the battlefield by matching the card name
+                blocker = next((perm for perm in self.game_state["battlefield"][defending_player] if perm["card"] == blocker_card), None)
+
+                if blocker is None:
+                    print(f"[GAME ENGINE] Blocker '{blocker_card}' not found on battlefield for {defending_player}.")
+                    continue
+
+                blocker_toughness = blocker.get("toughness", 0)
+                blocker_damage = blocker.get("damage", 0)
+
+                lethal_damage = max(0, blocker_toughness - blocker_damage)
+
+                damage_to_block = min(remaining_power, lethal_damage)
+
+                blocker["damage"] = blocker_damage + damage_to_block
+                remaining_power -= damage_to_block
+
+                damage_events.append({
+                    "source": attacker_card,
+                    "target": blocker_card,
+                    "controller": active_player,
+                    "amount": damage_to_block
+                })
+
+                if remaining_power <= 0:
+                    break
+
+        # 2) Resolve damage for each blocker against their assigned attacker
+        for block in blockers:
+            blocker_card = block.get("blocker")
+            attacker_card = block.get("attacker")
+
+            # Find the attacker permanent on the battlefield by matching the card name
+            attacker = next((perm for perm in self.game_state["battlefield"][active_player] if perm["card"] == attacker_card), None)
+
+            if attacker is None:
+                print(f"[GAME ENGINE] Attacker '{attacker_card}' not found on battlefield for {active_player}.")
+                continue
+
+            attacker_damage = attacker.get("damage", 0)
+
+            # Find the blocker permanent on the battlefield by matching the card name
+            blocker = next((perm for perm in self.game_state["battlefield"][defending_player] if perm["card"] == blocker_card), None)
+
+            if blocker is None:
+                print(f"[GAME ENGINE] Blocker '{blocker_card}' not found on battlefield for {defending_player}.")
+                continue
+
+            blocker_power = blocker.get("power", 0)
+
+            # Blocker deals damage to the attacker
+            attacker["damage"] = attacker_damage + blocker_power
+
+            damage_events.append({
+                "source": blocker_card,
+                "target": attacker_card,
+                "controller": defending_player,
+                "amount": blocker_power
+            })
+
+        # 3) Check for destroyed creatures and move them to the graveyard
+        creatures_died = []
+        for player_id in [active_player, defending_player]:
+            creatures_to_remove = []
+            battlefield = self.game_state["battlefield"][player_id]
+            graveyard = self.game_state["graveyard"][player_id]
+
+            if "toughness" not in perm or "damage" not in perm:
+                print(f"[GAME ENGINE] Warning: Creature permanent missing 'toughness' or 'damage' attributes for player {player_id}. Skipping damage check.")
+                continue
+
+            for perm in battlefield:
+                card_name = perm.get("card")
+                damage = perm.get("damage", 0)
+                toughness = perm.get("toughness", 0)
+
+                if damage >= toughness:
+                    creatures_to_remove.append((player_id, card_name))
+                    graveyard.append(card_name)
+                    creatures_died.append(card_name)
+
+            self.game_state["battlefield"][player_id] = [perm for perm in self.game_state["battlefield"][player_id] if (player_id, perm.get("card")) not in creatures_to_remove]
+
+        print(f"[GAME ENGINE] Combat resolution completed. Damage events: {damage_events}")
+
+        # 4) Check for a player's life total reaching 0 or below
+        loser = None
+        for player_id, life_total in self.game_state["life_totals"].items():
+            if life_total <= 0:
+                print(f"[GAME ENGINE] {player_id} has been reduced to {life_total} life. Game over.")
+                loser = player_id
+
+        # 5 Reset combat result and damage order for the next combat phase
+        result = {
+            "damage_events": damage_events,
+            "life_totals": self.game_state["life_totals"].copy(),
+            "creatures_died": creatures_died,
+            "loser": loser
+        }
+
+        print(f"[GAME ENGINE] Combat resolution result: {result}")
+
+        # Reset if needed for next combat phase, but keep the damage events and life totals for reporting
+        # Comment the code block if wrong
+        self.game_state["combat"]["attackers"] = []
+        self.game_state["combat"]["blockers"] = {}
+        self.game_state["combat"]["damage_order"] = {}
+
+        return result
+    
+
 if __name__ == "__main__":
     server = MTGNPServer()
     server.start()
