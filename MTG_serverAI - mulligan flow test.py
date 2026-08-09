@@ -310,13 +310,21 @@ class MTGNPServer:
             "phase": "MULLIGAN",
             "step": "MAIN",
             "active_player": starting_player,
+
+            "priority_holder": None,
+
             "life_totals": {p1_id: 20, p2_id: 20},
             "hands": {p1_id: p1_hand, p2_id: p2_hand},
             "libraries": {p1_id: p1_library, p2_id: p2_library},
             "battlefield": {p1_id: [], p2_id: []},
             "graveyard": {p1_id: [], p2_id: []},
             "stack": [],
-            "land_cast_on_turn": False
+            "land_cast_on_turn": False,
+            "combat": {
+                "attackers": [],
+                "blockers": {},
+                "damage_order": []
+            }
         }
         self.engine.game_state = self.game_state
 
