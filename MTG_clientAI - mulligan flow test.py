@@ -249,7 +249,7 @@ class MTGNPClient:
                         send_pdu(self.sock, pdu)
                         print("[CLIENT] Taking mulligan...")
                     else:
-                        print("Mulligan phase. Type either 'keep [card1, card2]' or 'mulligan': ", end="", flush=True)
+                        print("Mulligan phase. Type either 'keep (put number of cards depending on mulligan count)' or 'mulligan': ", end="", flush=True)
                     continue
 
                 if cmd.lower().startswith("ready"):
