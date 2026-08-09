@@ -140,6 +140,12 @@ class MTGNPClient:
             elif msg_type == "PHASE_TRANSITION":
                 with self.lock:
                     self.current_priority_seq = seq_num
+                    new_phase = pdu.get("phase")
+                    new_step = pdu.get("step")
+                    if new_phase:
+                        self.visible_state["phase"] = new_phase
+                    if new_step:
+                        self.visible_state["step"] = new_step
                 print(f"\n[PHASE] Transited to {pdu.get('phase')} - {pdu.get('step')}")
 
             elif msg_type == "ERROR":

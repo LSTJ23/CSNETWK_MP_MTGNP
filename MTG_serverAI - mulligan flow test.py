@@ -422,6 +422,11 @@ class MTGNPServer:
         # Broadcast transition to Untap Step
         self.game_state["phase"] = "UNTAP"
         self.game_state["step"] = "NONE"
+        
+        for p in self.players:
+            self.send_game_state_update(p)
+        
+        
         self.broadcast({
             "type": "PHASE_TRANSITION",
             "seq_num": self.get_next_seq(),
@@ -526,6 +531,9 @@ class MTGNPServer:
         self.game_state["phase"] = new_phase
         self.game_state["step"] = new_step
         self.consecutive_passes = 0
+        
+        for p in self.players:
+            self.send_game_state_update(p)
         
         self.broadcast({
             "type": "PHASE_TRANSITION",
