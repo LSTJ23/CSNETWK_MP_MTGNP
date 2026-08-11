@@ -56,7 +56,6 @@ def recv_pdu(sock: socket.socket) -> dict:
     payload_bytes = recv_exact(sock, length)
     return json.loads(payload_bytes.decode('utf-8'))
 
-
 class MTGNPServer:
     def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT):
         self.host = host
