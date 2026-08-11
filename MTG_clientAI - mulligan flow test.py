@@ -59,7 +59,6 @@ class MTGNPClient:
         try:
             self.sock.connect((self.host, self.port))
             print(f"[CLIENT] Connected to server at {self.host}:{self.port}")
-            print("[LOBBY] Type 'ready <player_id> [card1,card2,...]' to signal ready state.")
         except Exception as e:
             print(f"[CLIENT] Connection failed: {e}")
             return
@@ -178,17 +177,50 @@ class MTGNPClient:
                     break
 
     def render_visible_state(self):
-        print("\n" + "=" * 50)
-        print("--- AUTHORITATIVE VISIBLE GAME STATE ---")
-        print(f"Turn: {self.visible_state.get('turn')} | Phase: {self.visible_state.get('phase')} | Active Player: {self.visible_state.get('active_player')}")
-        print(f"Life Totals: {self.visible_state.get('life_totals', {})}")
-        print(f"Your Hand: {self.visible_state.get('hand', [])}")
-        print(f"Opponent Hand Counts: {self.visible_state.get('hand_counts', {})}")
-        print(f"Library Counts: {self.visible_state.get('library_counts', {})}")
-        print(f"Battlefield: {self.visible_state.get('battlefield', {})}")
-        print(f"Graveyard: {self.visible_state.get('graveyard', {})}")
-        print(f"Stack: {self.visible_state.get('stack', [])}")
-        print("=" * 50)
+        self.cleanprint(
+            f"\n{'=' * 50}\n"
+            f"--- AUTHORITATIVE VISIBLE GAME STATE ---\n"
+            f"Turn: {self.visible_state.get('turn')} | Phase: {self.visible_state.get('phase')} | Active Player: {self.visible_state.get('active_player')}\n"
+            f"Life Totals: {self.visible_state.get('life_totals', {})}\n"
+            f"Your Hand: {self.visible_state.get('hand', [])}\n"
+            f"Opponent Hand Counts: {self.visible_state.get('hand_counts', {})}\n"
+            f"Library Counts: {self.visible_state.get('library_counts', {})}\n"
+            f"Battlefield: {self.visible_state.get('battlefield', {})}\n"
+            f"Graveyard: {self.visible_state.get('graveyard', {})}\n"
+            f"Stack: {self.visible_state.get('stack', [])}\n"
+            f"{'=' * 50}"
+        )
+
+    def get_available_commands(self) -> str:
+        """Returns valid commands based on current state and phase."""
+        if self.awaiting_rematch_decision:
+            return "yes | no"
+
+        # Default to LOBBY if phase is not yet set in visible_state
+        phase = self.visible_state.get("phase", "LOBBY")
+
+        if phase == "LOBBY":
+            return "ready <player_id> [card1,card2,...]"
+
+        if phase == "MULLIGAN":
+            return "keep [cards] | mulligan"
+
+        # In-game checks: if player does not have priority
+        if not self.has_priority:
+            return "concede (Waiting for priority...)"
+
+        # In-game options when holding priority, tailored by phase
+        if phase in ["PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"]:
+            return "pass | cast <card_id> | play <card_id> | concede"
+            
+        elif phase == "DECLARE_ATTACKERS":
+            return "attack <card1,card2,...> | pass | concede"
+            
+        elif phase == "DECLARE_BLOCKERS":
+            return "block <blocker:attacker,...> | pass | concede"
+
+        # Default actions for instant-speed / response phases (e.g., UPKEEP, DRAW, COMBAT_DAMAGE)
+        return "pass | cast <card_id> | concede"
 
     def send_player_ready(self, player_id: str, deck_list: list):
         pdu = {
@@ -215,7 +247,8 @@ class MTGNPClient:
     def user_input_loop(self):
         while self.running:
             try:
-                cmd = input("> ").strip()
+                valid_cmds = self.get_available_commands()
+                cmd = input(f"[Valid Commands: {valid_cmds}]\n> ").strip()
                 if not cmd:
                     continue
 
