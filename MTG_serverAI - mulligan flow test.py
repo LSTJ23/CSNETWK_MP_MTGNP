@@ -5,6 +5,7 @@ import struct
 import threading
 import time
 import random
+import os
 
 from card_catalog import load_card_catalog
 
@@ -60,6 +61,7 @@ class MTGNPServer:
         self.port = port
         self.server_seq_num = 1
         self.seq_lock = threading.Lock()
+        self.running = True
         
         try:
             self.card_catalog, self.base_cards = load_card_catalog("mtgnp_master_card_list.xlsx")
@@ -125,7 +127,15 @@ class MTGNPServer:
                 "graveyard": [],
                 "life": 20
             }
-            print(f"[SERVER] Player {player_id} submitted a valid 60-card deck and is ready.")
+            print(f"[SERVER] Player {player_id} submitted a valid card deck and is ready.")
+
+        # Send success response so the client loop knows to stop prompting
+        send_pdu(sock, {
+            "type": "PLAYER_READY_ACK",
+            "seq_num": self.get_next_seq(),
+            "player_id": player_id,
+            "status": "ACCEPTED"
+        })
             
     def check_win_conditions(self):
         """
@@ -759,8 +769,11 @@ class MTGNPServer:
                     pass
                 print(f"[SERVER] Cleaned up session for {pid}. Active connections: {len(self.players)}", flush=True)
 
-class GameEngine:
+                if len(self.players) == 0:
+                    print("[SERVER] No active connections remaining. Shutting down...")
+                    os._exit(0)
 
+class GameEngine:
     # initialize game engine with game state and card catalog
     def __init__(self, game_state, card_catalog):
         """
