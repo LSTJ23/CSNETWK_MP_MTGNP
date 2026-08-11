@@ -4,6 +4,7 @@ import json
 import struct
 import sys
 import time
+import os
 
 MAX_PDU_SIZE = 65535
 DEFAULT_HOST = '127.0.0.1'
@@ -58,7 +59,7 @@ class MTGNPClient:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self.sock.connect((self.host, self.port))
-            print(f"[CLIENT] Connected to server at {self.host}:{self.port}")
+            self.cleanprint(f"[CLIENT] Connected to server at {self.host}:{self.port}")
         except Exception as e:
             print(f"[CLIENT] Connection failed: {e}")
             return
@@ -99,7 +100,8 @@ class MTGNPClient:
 
     def cleanprint(self, message: str):
         # Clears the active prompt line, prints the server message, and restores '> '.
-        print(f"\r\033[K{message}\n> ", end="", flush=True)
+        print(f"\r\033[K{message}\n"
+              f"[Valid Commands: {self.get_available_commands()}]\n\n> ", end="", flush=True)
 
     def listen_for_messages(self):
         while self.running:
@@ -107,7 +109,7 @@ class MTGNPClient:
                 pdu = recv_pdu(self.sock)
             except (ConnectionResetError, struct.error, ValueError):
                 if self.running:
-                    self.cleanprint("[CLIENT] Server connection lost.")
+                    print("[CLIENT] Server connection lost.")
                 self.shutdown()
                 break
 
@@ -127,7 +129,7 @@ class MTGNPClient:
                 with self.lock:
                     state_data = pdu.get("state", {})
                     if state_data.get("phase") == "LOBBY":
-                        self.cleanprint(f"[LOBBY UPDATE] Ready: {state_data.get('players_ready')}/2. Waiting for: {state_data.get('waiting_for')}")
+                        print(f"[LOBBY UPDATE] Ready: {state_data.get('players_ready')}/2. Waiting for: {state_data.get('waiting_for')}")
                     else:
                         self.visible_state = state_data
                         # If mulligan, update current_priority_seq to echo seq_num
@@ -139,7 +141,7 @@ class MTGNPClient:
                 with self.lock:
                     self.current_priority_seq = seq_num
                     self.has_priority = True
-                self.cleanprint(f">>> Priority Granted! [seq_num: {seq_num}] Commands: 'pass', 'cast <card_id>', 'concede'")
+                self.cleanprint(f">>> Priority Granted! [{seq_num}]")
 
             elif msg_type == "PHASE_TRANSITION":
                 with self.lock:
@@ -156,12 +158,11 @@ class MTGNPClient:
                 self.cleanprint(f"[SERVER REJECTION] {pdu.get('code')}: {pdu.get('message')}")
 
             elif msg_type == "GAME_OVER":
-                self.cleanprint(f"[GAME OVER] Winner: {pdu.get('winner')} | Reason: {pdu.get('reason')}")
+                print(f"[GAME OVER] Winner: {pdu.get('winner')} | Reason: {pdu.get('reason')}")
 
             elif msg_type == "REMATCH_REQUEST":
                 self.awaiting_rematch_decision = True
                 self.cleanprint(f"[REMATCH] {pdu.get('message')}")
-                self.cleanprint("Type 'yes' or 'no': ", end="", flush=True)
 
             elif msg_type == "REMATCH_RESULT":
                 accepted = pdu.get("accepted", False)
@@ -194,33 +195,29 @@ class MTGNPClient:
     def get_available_commands(self) -> str:
         """Returns valid commands based on current state and phase."""
         if self.awaiting_rematch_decision:
-            return "yes | no"
+            return "yes | no | /exit"
 
-        # Default to LOBBY if phase is not yet set in visible_state
         phase = self.visible_state.get("phase", "LOBBY")
 
         if phase == "LOBBY":
-            return "ready <player_id> [card1,card2,...]"
+            return "ready <player_id> [card1,card2,...] | /exit"
 
         if phase == "MULLIGAN":
-            return "keep [cards] | mulligan"
+            return "keep | mulligan | concede | /exit"
 
-        # In-game checks: if player does not have priority
         if not self.has_priority:
-            return "concede (Waiting for priority...)"
+            return "concede | /exit (Waiting for priority...)"
 
-        # In-game options when holding priority, tailored by phase
         if phase in ["PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"]:
-            return "pass | cast <card_id> | play <card_id> | concede"
+            return "pass | cast <card_id> | play <card_id> | concede | /exit"
             
         elif phase == "DECLARE_ATTACKERS":
-            return "attack <card1,card2,...> | pass | concede"
+            return "attack <card1,card2,...> | pass | concede | /exit"
             
         elif phase == "DECLARE_BLOCKERS":
-            return "block <blocker:attacker,...> | pass | concede"
+            return "block <blocker:attacker,...> | pass | concede | /exit"
 
-        # Default actions for instant-speed / response phases (e.g., UPKEEP, DRAW, COMBAT_DAMAGE)
-        return "pass | cast <card_id> | concede"
+        return "pass | cast <card_id> | play <card_id> | concede | /exit"
 
     def send_player_ready(self, player_id: str, deck_list: list):
         pdu = {
@@ -247,11 +244,19 @@ class MTGNPClient:
     def user_input_loop(self):
         while self.running:
             try:
-                valid_cmds = self.get_available_commands()
-                cmd = input(f"[Valid Commands: {valid_cmds}]\n> ").strip()
+                cmd = input().strip()
                 if not cmd:
+                    self.cleanprint("")
                     continue
 
+                # Global exit shortcut
+                if cmd.lower() == "/exit":
+                    print("[CLIENT] Exiting immediately...")
+                    self.running = False
+                    self.shutdown()
+                    os._exit(0)
+
+                # 1. Rematch phase logic
                 if self.awaiting_rematch_decision:
                     if cmd.lower() in ["yes", "y"]:
                         self.send_action("REMATCH_RESPONSE", {"accepted": True})
@@ -264,12 +269,35 @@ class MTGNPClient:
                         self.shutdown()
                         break
                     else:
-                        print("Please type 'yes' or 'no': ", end="", flush=True)
+                        print(f"Invalid command.")
                     continue
                 
-                if self.visible_state.get("phase") == "MULLIGAN": 
+                current_phase = self.visible_state.get("phase", "LOBBY")
+
+                # 2. Lobby phase logic
+                if current_phase == "LOBBY":
+                    if cmd.lower().startswith("ready"):
+                        parts = cmd.split(maxsplit=2)
+                        if len(parts) < 2:
+                            print("Usage: ready <player_id> <card1,card2,...>")
+                            continue
+                        p_id = parts[1]
+                        raw_cards = parts[2] if len(parts) > 2 else ""
+                        clean_cards = raw_cards.translate(str.maketrans("", "", "[]\"'"))
+                        cards = [c.strip() for c in clean_cards.split(",") if c.strip()]
+                        self.send_player_ready(p_id, cards)
+                        continue
+                    elif cmd.lower() in ["/exit", "concede"]:
+                        self.send_action("CONCEDE")
+                        continue
+                    else:
+                        print(f"Invalid command.")
+                        continue
+
+                # 3. Mulligan phase logic
+                if current_phase == "MULLIGAN":
                     if cmd.lower().startswith("keep"):
-                        parts = cmd.split(maxsplit = 1)
+                        parts = cmd.split(maxsplit=1)
                         cards_to_bottom = []
                         if len(parts) > 1:
                             clean_input = parts[1].translate(str.maketrans("", "", "[]\"'"))
@@ -277,7 +305,7 @@ class MTGNPClient:
                         
                         pdu = {
                             "type": "MULLIGAN_CHOICE",
-                            "seq_num": self.last_server_seq,  # Echoes the updated sequence number received from redraw/update
+                            "seq_num": self.last_server_seq,
                             "keep": True,
                             "cards_to_bottom": cards_to_bottom
                         }
@@ -286,56 +314,43 @@ class MTGNPClient:
                     elif cmd.lower() == "mulligan": 
                         pdu = {
                             "type": "MULLIGAN_CHOICE",
-                            "seq_num": self.last_server_seq,  # Echoes the updated sequence number received from redraw
+                            "seq_num": self.last_server_seq,
                             "keep": False,
                             "cards_to_bottom": []
                         }
                         send_pdu(self.sock, pdu)
                         print("[CLIENT] Taking mulligan...")
+                    elif cmd.lower() == "concede":
+                        self.send_action("CONCEDE")
                     else:
-                        print("Mulligan phase. Type either 'keep (put number of cards depending on mulligan count)' or 'mulligan': ", end="", flush=True)
+                        print(f"Invalid command in MULLIGAN phase.")
                     continue
 
-                if cmd.lower().startswith("ready"):
-                    parts = cmd.split(maxsplit=2)
-                    if len(parts) < 2:
-                        print("Usage: ready <player_id> <card1,card2,...>")
-                        continue
-                    
-                    p_id = parts[1]
-                    # Parse and sanitize card list
-                    raw_cards = parts[2] if len(parts) > 2 else ""
-                    clean_cards = raw_cards.translate(str.maketrans("", "", "[]\"'"))
-                    cards = [c.strip() for c in clean_cards.split(",") if c.strip()]
-                    
-                    self.send_player_ready(p_id, cards)
+                # 4. In-game actions (UNTAP, UPKEEP, MAIN, COMBAT, etc.)
+                if not self.has_priority:
+                    print("You do not hold priority.")
                     continue
 
-                if cmd.lower() in ["/exit", "concede"]:
+                parts = cmd.split(maxsplit=1)
+                action = parts[0].lower()
+
+                if action == "pass":
+                    self.send_action("PRIORITY_PASS")
+                elif action == "cast" and len(parts) > 1:
+                    self.send_action("CAST_SPELL", {"card_id": parts[1]})
+                elif action == "play" and len(parts) > 1:
+                    self.send_action("PLAY_LAND", {"card_id": parts[1]})
+                elif action == "attack" and len(parts) > 1:
+                    raw_cards = parts[1].translate(str.maketrans("", "", "[]\"'"))
+                    attackers = [c.strip() for c in raw_cards.split(",") if c.strip()]
+                    self.send_action("DECLARE_ATTACKERS", {"attackers": attackers})
+                elif action == "block" and len(parts) > 1:
+                    self.send_action("DECLARE_BLOCKERS", {"blockers": parts[1]})    
+                elif action == "concede":
                     self.send_action("CONCEDE")
-                    continue
-
                 else:
-                    print("Unknown command. Please try again")
-
-
-                # if not self.has_priority:
-                #     print("You do not hold priority.")
-                #     continue
-
-                # ADD THIS AS A GAME STATE ONLY
-                # parts = cmd.split(maxsplit=1)
-                # action = parts[0].lower()
-
-                # if action == "pass":
-                #     self.send_action("PRIORITY_PASS")
-                # elif action == "cast" and len(parts) > 1:
-                #     self.send_action("CAST_SPELL", {"card_id": parts[1]})
-                # elif action == "play" and len(parts) > 1:
-                #     self.send_action("PLAY_LAND", {"card_id": parts[1]})
-                # else:
-                #     print("Invalid command. Options: 'pass', 'cast <card_id>', 'concede'")
-
+                    print(f"Invalid command.")
+                    
             except (KeyboardInterrupt, EOFError):
                 break
 
