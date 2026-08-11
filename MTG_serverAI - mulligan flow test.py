@@ -746,6 +746,88 @@ class MTGNPServer:
                             self.send_game_state_update(p)
                         self.grant_priority(current_pid)
 
+                    elif pdu_type == "DECLARE_ATTACKERS":
+                        attackers_ids = [
+                            attacker.get("card_id") for attacker in pdu.get("attackers", [])
+                        ]
+
+                        success = self.engine.declare_attackers(current_pid, attackers_ids)
+
+                        if not success:
+                            send_pdu(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"Invalid attackers declaration",
+                            })
+                            self.grant_priority(current_pid)
+                            continue
+
+                        self.game_state["combat"]["attackers"] = attackers_ids
+
+                        # Broadcast updated game state and transition to DECLARE_BLOCKERS
+                        for p in self.players:
+                            self.send_game_state_update(p)
+
+                        self.grant_priority(current_pid)
+                        self.transition_phase("COMBAT", "DECLARE_BLOCKERS")
+
+                    elif pdu_type == "DECLARE_BLOCKERS":
+
+                        if current_pid == self.game_state["active_player"]:
+                            send_pdu(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"Active player cannot declare blockers.",
+                            })
+                            continue
+
+                        blockers_dict = pdu.get("blockers", {})
+                        success = self.engine.declare_blockers(current_pid, blockers_dict)
+
+                        if not success:
+                            send_pdu(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"Invalid blockers declaration",
+                            })
+                            self.grant_priority(current_pid)
+                            continue
+
+                        self.game_state["combat"]["blockers"] = blockers_dict
+
+                        # Broadcast updated game state and transition to COMBAT_DAMAGE
+                        for p in self.players:
+                            self.send_game_state_update(p)
+
+                        self.grant_priority(current_pid)
+                        self.transition_phase("COMBAT", "ASSIGN_DAMAGE_ORDER")
+
+                    elif pdu_type == "ASSIGN_DAMAGE_ORDER":
+                        damage_order = pdu.get("damage_order", [])
+                        success = self.engine.assign_damage_order(current_pid, damage_order)
+
+                        if not success:
+                            send_pdu(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"Invalid damage assignment order.",
+                            })
+                            self.grant_priority(current_pid)
+                            continue
+
+                        self.game_state["combat"]["damage_order"] = damage_order
+
+                        # Broadcast updated game state and transition to COMBAT_DAMAGE
+                        for p in self.players:
+                            self.send_game_state_update(p)
+
+                        self.grant_priority(current_pid)
+                        self.transition_phase("COMBAT", "COMBAT_DAMAGE")
+
         finally:
             # Always clean up player state upon thread exit
             with self.lock:
@@ -956,7 +1038,7 @@ class GameEngine:
     def declare_attackers(self, player_id, attackers):
         """Handles the declaration of attackers for the given player."""
 
-        if self.game_state["phase"] != "DECLARE_ATTACKERS":
+        if self.game_state["step"] != "DECLARE_ATTACKERS":
             return False
         
         if player_id != self.game_state["active_player"]:
@@ -986,7 +1068,7 @@ class GameEngine:
     def declare_blockers(self, player_id, blockers):
         """Handles the declaration of blockers for the given player."""
 
-        if self.game_state["phase"] != "DECLARE_BLOCKERS":
+        if self.game_state["step"] != "DECLARE_BLOCKERS":
             return False
         
         all_pids = list(self.game_state["life_totals"].keys())
@@ -1012,7 +1094,7 @@ class GameEngine:
                 return False
 
             # Validate that the attacker is among the declared attackers
-            valid_attacker = next((perm for perm in attackers if perm["card"] == attacker_card), None)
+            valid_attacker = next((card_id for card_id in attackers if card_id == attacker_card), None)
             if not valid_attacker:
                 print(f"[GAME ENGINE] Invalid attacker '{attacker_card}' declared by {player_id}. Not among declared attackers.")
                 return False
@@ -1032,7 +1114,7 @@ class GameEngine:
     def assign_damage_order(self, player_id, damage_order):
         """Handles the assignment of damage order for the given player."""
 
-        if self.game_state["phase"] != "ASSIGN_DAMAGE_ORDER":
+        if self.game_state["step"] != "ASSIGN_DAMAGE_ORDER":
             return False
         
         all_pids = list(self.game_state["life_totals"].keys())
@@ -1070,10 +1152,9 @@ class GameEngine:
             actual_blockers = [b["blocker"] for b in blockers if b["attacker"] == attacker_card]
 
             # Make sure the submitted blockers are exactly the same as the actual blockers for this attacker
-            if set(blocker_card.get(attacker_card, [])) != set(actual_blockers):
-                print(f"[GAME ENGINE] Damage order mismatch for attacker '{attacker_card}'. Expected blockers: {actual_blockers}, got: {blocker_card.get(attacker_card, [])}")
-                return False
-
+            # if set(blocker_card.get(attacker_card, [])) != set(actual_blockers):
+            #     print(f"[GAME ENGINE] Damage order mismatch for attacker '{attacker_card}'. Expected blockers: {actual_blockers}, got: {blocker_card.get(attacker_card, [])}")
+            #     return Falser
             # blockers.get() returns a list of blockers for the given attacker, or an empty list if none exist
             damage_order[attacker_card] = blockers.get(attacker_card, []) + [blocker_card]
 
@@ -1111,9 +1192,9 @@ class GameEngine:
 
         # 1) Resolve damage for each attacker based on assigned blockers and damage order
         for attacker in attackers:
-            attacker_card = attacker["card"]
+            attacker_card = next((perm for perm in self.game_state["battlefield"][active_player] if perm["card"] == attacker), None)
 
-            power = attacker.get("power", 0)
+            power = attacker_card.get("power", 0)
 
             assigned_blockers = [b["blocker"] for b in blockers if b["attacker"] == attacker_card]
 
@@ -1201,11 +1282,12 @@ class GameEngine:
             battlefield = self.game_state["battlefield"][player_id]
             graveyard = self.game_state["graveyard"][player_id]
 
-            if "toughness" not in perm or "damage" not in perm:
-                print(f"[GAME ENGINE] Warning: Creature permanent missing 'toughness' or 'damage' attributes for player {player_id}. Skipping damage check.")
-                continue
-
             for perm in battlefield:
+
+                if "toughness" not in perm or "damage" not in perm:
+                    print(f"[GAME ENGINE] Warning: Creature permanent missing 'toughness' or 'damage' attributes for player {player_id}. Skipping damage check.")
+                    continue
+                
                 card_name = perm.get("card")
                 damage = perm.get("damage", 0)
                 toughness = perm.get("toughness", 0)
