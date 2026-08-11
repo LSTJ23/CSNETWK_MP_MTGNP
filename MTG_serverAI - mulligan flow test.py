@@ -20,6 +20,8 @@ PHASE_SEQUENCES = [
     "POSTCOMBAT_MAIN", "END_STEP", "CLEANUP"
 ]
 
+STEPS = ["NONE", "BEGIN_COMBAT", "DECLARE_ATTACKERS", "DECLARE_BLOCKERS", "ASSIGN_DAMAGE_ORDER", "END_OF_COMBAT", "COMBAT_DAMAGE", "CLEANUP"]
+
 def send_pdu(sock: socket.socket, payload: dict) -> None:
     """Encodes JSON payload and prefixes it with a 4-byte big-endian header."""
     json_bytes = json.dumps(payload).encode('utf-8')
@@ -544,12 +546,16 @@ class MTGNPServer:
             self.trigger_game_over(winner, "DISCONNECT")
 
     def transition_phase(self, new_phase: str, new_step: str):
+        old_phase = self.game_state["phase"]
+        old_step = self.game_state.get("step", "NONE")
+
         self.game_state["phase"] = new_phase
         self.game_state["step"] = new_step
         self.consecutive_passes = 0
         
         for p in self.players:
             self.send_game_state_update(p)
+
         
         self.broadcast({
             "type": "PHASE_TRANSITION",
@@ -1299,7 +1305,7 @@ class GameEngine:
                 if "toughness" not in perm or "damage" not in perm:
                     print(f"[GAME ENGINE] Warning: Creature permanent missing 'toughness' or 'damage' attributes for player {player_id}. Skipping damage check.")
                     continue
-                
+
                 card_name = perm.get("card")
                 damage = perm.get("damage", 0)
                 toughness = perm.get("toughness", 0)
