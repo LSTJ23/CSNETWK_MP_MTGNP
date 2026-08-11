@@ -65,7 +65,8 @@ class MTGNPClient:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self.sock.connect((self.host, self.port))
-            self.cleanprint(f"[CLIENT] Connected to server at {self.host}:{self.port}")
+            verbose_status = "ENABLED" if self.verbose else "DISABLED"
+            self.cleanprint(f"[CLIENT] Connected to server at {self.host}:{self.port} | Verbose Mode: [{verbose_status}]")
         except Exception as e:
             print(f"[CLIENT] Connection failed: {e}")
             return

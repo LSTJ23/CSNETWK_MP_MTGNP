@@ -3,7 +3,6 @@ import json
 import socket
 import struct
 import threading
-import time
 import random
 import os
 import argparse
@@ -171,7 +170,9 @@ class MTGNPServer:
         # Bind to 0.0.0.0 to accept IPv4, IPv6 localhost, and LAN connections
         server_sock.bind(("0.0.0.0", self.port))
         server_sock.listen(5)
-        print(f"[SERVER] Listening on 0.0.0.0:{self.port}...", flush=True)
+
+        verbose_status = "ENABLED" if self.verbose else "DISABLED"
+        print(f"[SERVER] Listening on 0.0.0.0:{self.port} | Verbose Mode: [{verbose_status}] ", flush=True)
 
         while True:
             try:
