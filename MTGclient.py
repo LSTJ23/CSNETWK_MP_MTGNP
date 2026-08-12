@@ -355,10 +355,20 @@ class MTGNPClient:
                     self.send_action("PLAY_LAND", {"card_id": parts[1]})
                 elif action == "attack" and len(parts) > 1:
                     raw_cards = parts[1].translate(str.maketrans("", "", "[]\"'"))
-                    attackers = [c.strip() for c in raw_cards.split(",") if c.strip()]
+                    attackers_id = [c.strip() for c in raw_cards.split(",") if c.strip()]
+                    attackers = [{"card_id": c, "card": c} for c in attackers_id]
                     self.send_action("DECLARE_ATTACKERS", {"attackers": attackers})
                 elif action == "block" and len(parts) > 1:
-                    self.send_action("DECLARE_BLOCKERS", {"blockers": parts[1]})    
+                    blockers = []
+                    declaration = parts[1].translate(str.maketrans("", "", "[]\"'"))
+                    for pair in declaration.split(","):
+                        if ":" not in pair:
+                            print(f"Invalid block declaration: {pair}. Use format blocker:attacker.")
+                            continue
+                        blocker, attacker = pair.split(":", 1)
+                        blockers.append({"blocker": blocker.strip(), "attacker": attacker.strip()})
+
+                    self.send_action("DECLARE_BLOCKERS", {"blockers": blockers})
                 elif action == "concede":
                     self.send_action("CONCEDE")
                 else:

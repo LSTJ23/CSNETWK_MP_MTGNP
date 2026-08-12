@@ -604,6 +604,35 @@ class MTGNPServer:
                 for p in self.players:
                     self.send_game_state_update(p)
 
+    def resolve_combat_damage_and_continue(self):
+        print(f"[SERVER] Resolving combat damage for {self.game_state['active_player']}.")
+
+        result = self.engine.resolve_combat_damage(self.game_state["active_player"])
+
+        if result is False:
+            print(f"[SERVER] Combat damage resolution failed for {self.game_state['active_player']}.")
+            return
+
+        self.broadcast({
+            "type": "COMBAT_DAMAGE_RESOLVED",
+            "seq_num": self.get_next_seq(),
+            "active_player": self.game_state["active_player"],
+            "damage_events": result.get("damage_events", []),
+            "life_totals": result.get("life_totals", {}),
+            "creatures_died": result.get("creatures_died", []),
+        })
+
+        if result.get("loser") != None:
+            winner = next(p for p in self.game_state["life_totals"].keys() if p != result["loser"])
+            self.trigger_game_over(winner, "LIFE_ZERO")
+            print(f"[SERVER] Player {result['loser']} lost all life during combat damage. Game over.")
+            return
+
+        for p in self.players:
+            self.send_game_state_update(p)
+
+        self.transition_phase("END_OF_COMBAT", "NONE")
+
     def trigger_game_over(self, winner_id: str, reason: str):
         with self.lock:
             if self.state == "GAME_OVER":
@@ -939,7 +968,7 @@ class MTGNPServer:
                             self.send_game_state_update(p)
 
                         self.grant_priority(current_pid)
-                        self.transition_phase("COMBAT", "DECLARE_BLOCKERS")
+                        self.transition_phase("DECLARE_BLOCKERS", "DECLARE_BLOCKERS")
 
                     elif pdu_type == "DECLARE_BLOCKERS":
 
@@ -972,7 +1001,7 @@ class MTGNPServer:
                             self.send_game_state_update(p)
 
                         self.grant_priority(current_pid)
-                        self.transition_phase("COMBAT", "ASSIGN_DAMAGE_ORDER")
+                        self.transition_phase("ASSIGN_DAMAGE_ORDER", "ASSIGN_DAMAGE_ORDER")
 
                     elif pdu_type == "ASSIGN_DAMAGE_ORDER":
                         damage_order = pdu.get("damage_order", [])
@@ -995,7 +1024,7 @@ class MTGNPServer:
                             self.send_game_state_update(p)
 
                         self.grant_priority(current_pid)
-                        self.transition_phase("COMBAT", "COMBAT_DAMAGE")
+                        self.resolve_combat_damage_and_continue() # resolve combat damage
 
         finally:
             # Always clean up player state upon thread exit
@@ -1257,7 +1286,7 @@ class GameEngine:
 
                 if permanent.get("summoning_sickness", False):
                     permanent["summoning_sickness"] = False
-                    
+
         print(f"[GAME ENGINE] Untap step completed for {player_id}. All permanents untapped.")
 
     def resolve_creature(self, stack_item):
