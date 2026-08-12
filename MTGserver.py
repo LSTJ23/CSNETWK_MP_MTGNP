@@ -305,7 +305,8 @@ class MTGNPServer:
                 "attackers": [],
                 "blockers": {},
                 "damage_order": []
-            }
+            },
+            "mana_pool": {p1_id: {"R": 0, "G": 0, "U": 0, "B": 0, "W": 0}, p2_id: {"R": 0, "G": 0, "U": 0, "B": 0, "W": 0}}
         }
         self.engine.game_state = self.game_state
 
@@ -530,6 +531,79 @@ class MTGNPServer:
         })
         self.grant_priority(self.game_state["active_player"])
 
+    def advance_phase(self):
+        """ Move the game to the next phase/step in the PHASE_SEQUENCES list. """
+
+        current_phase = self.game_state["phase"]
+
+        try: 
+            current_index = PHASE_SEQUENCES.index(current_phase)
+        except ValueError:
+            print(f"[SERVER] Current phase '{current_phase}' not in PHASE_SEQUENCES. Resetting to UNTAP.")
+            self.transition_phase("UNTAP", "NONE")
+            return
+
+        if current_phase == "CLEANUP":
+            self.engine.cleanup_step(self.game_state["active_player"])
+            next_phase = "UNTAP"
+            all_pids = list(self.game_state["life_totals"].keys())
+
+            current_player = self.game_state["active_player"]
+            next_player = next((p for p in all_pids if p != current_player), current_player)
+
+            self.game_state["active_player"] = next_player
+            self.game_state["turn"] += 1
+
+            self.game_state["land_cast_on_turn"] = False
+
+            self.game_state["combat"]["attackers"].clear()
+            self.game_state["combat"]["blockers"].clear()
+            self.game_state["combat"]["damage_order"].clear()
+
+            self.broadcast({
+                "type": "PHASE_TRANSITION",
+                "seq_num": self.get_next_seq(),
+                "from_phase": "CLEANUP",
+                "to_phase": "UNTAP",
+                "active_player": next_player,
+                "turn": self.game_state["turn"]
+            })            
+
+            print(f"[SERVER] Turn {self.game_state['turn']} begins. Active player: {next_player}.")
+            self.transition_phase(next_phase, "NONE")
+            self.game_state["active_player"] = next_player
+
+            self.engine.untap_step(next_player)
+
+            return
+
+        next_phase = PHASE_SEQUENCES[current_index + 1]
+
+        print(f"[SERVER] Transitioning from {current_phase} to {next_phase}.")
+        self.transition_phase(next_phase, "NONE")
+
+        if next_phase == "UNTAP":
+            self.engine.untap_step(self.game_state["active_player"])
+
+        if next_phase == "DRAW":
+            if self.game_state["turn"] == 1:
+                print(f"[SERVER] Turn 1: Active player is {self.game_state['active_player']}, skipping draw step for first turn.")
+
+            else:
+                success = self.engine.draw_step(self.game_state["active_player"])
+
+                if not success:
+                    winner = next(p for p in self.game_state["life_totals"].keys() if p != self.game_state["active_player"])
+                    self.trigger_game_over(winner, "DECKOUT")
+                    print(f"[SERVER] Player {self.game_state['active_player']} attempted to draw from an empty library. {winner} wins by deckout.")
+                    return
+
+                else:
+                    print(f"[SERVER] Player {self.game_state['active_player']} drew a card successfully.")
+
+                for p in self.players:
+                    self.send_game_state_update(p)
+
     def trigger_game_over(self, winner_id: str, reason: str):
         with self.lock:
             if self.state == "GAME_OVER":
@@ -621,6 +695,84 @@ class MTGNPServer:
                     else:
                         self.handle_player_ready(player_info, pdu)
                     continue
+
+                if pdu_type == "PLAY_LAND":
+
+                    if current_pid != self.current_priority_player or client_seq != self.current_priority_seq:
+                        try:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "STALE_ACTION",
+                                "message": f"Priority token mismatch. Expected {self.current_priority_seq}, got {client_seq}.",
+                                "rejected_action": pdu
+                            })
+                        except ConnectionResetError:
+                            pass
+        
+
+                    if self.game_state["phase"] not in ["PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"]:
+                        try:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"PLAY_LAND can only be performed during PRECOMBAT_MAIN or POSTCOMBAT_MAIN phases."
+                            })
+                        except ConnectionResetError:
+                            pass
+                        continue
+
+                    card_id = pdu.get("card_id")
+
+                    if not card_id:
+                        try:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"PLAY_LAND PDU must include 'card_id'."
+                            })
+                        except ConnectionResetError:
+                            pass
+                        continue
+
+                    if self.game_state["land_cast_on_turn"]:
+                        try:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"Land has already been played this turn."
+                            })
+                        except ConnectionResetError:
+                            pass
+                        continue
+
+                    
+                    success = self.engine.play_land(current_pid, card_id)
+
+                    if not success:
+                        try:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"Cannot play land '{card_id}' (not in hand or land already played this turn)."
+                            })
+                        except ConnectionResetError:
+                            pass
+
+                    print(f"[SERVER] {current_pid} played land '{card_id}' successfully.")
+
+                    for p in self.players:
+                        self.send_game_state_update(p)
+
+                    self.game_state["land_cast_on_turn"] = True
+                    self.consecutive_passes = 0
+
+                    self.grant_priority(current_pid)
+                    continue
                 
                 if pdu_type == "MULLIGAN_CHOICE":
                     with self.lock:
@@ -682,48 +834,83 @@ class MTGNPServer:
                                 self.grant_priority(self.game_state["active_player"])
                             else:
                                 # 2. If stack is empty, transition to COMBAT
-                                self.transition_phase("COMBAT", "DECLARE_ATTACKERS")
+                                self.advance_phase()
                         else:
                             all_pids = [r["player_id"] for r in self.ready_players.values()]
                             next_player = next(p for p in all_pids if p != current_pid)
                             self.grant_priority(next_player)
 
                     elif pdu_type == "CAST_SPELL":
+
+                        if current_pid != self.game_state["active_player"]:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "STALE_ACTION",
+                                "message": f"Active player cannot cast spells when not active.",
+                                "rejected_action": pdu
+                            })
+                            continue
+
+                        if self.game_state["phase"] not in ["PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"]:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"CAST_SPELL can only be performed during PRECOMBAT_MAIN or POSTCOMBAT_MAIN phases."
+                            })
+                            continue
+
                         card_id = pdu.get("card_id")
-                        
-                        # 1. Determine if card is a Land or Spell
-                        base_card_name = "_".join(card_id.split("_")[:-1]) if card_id else ""
-                        card_info = self.base_cards.get(base_card_name, {})
-                        card_type = str(card_info.get("type", "")).upper()
-                        
-                        is_land = card_type == "LAND" or base_card_name in ["mountain", "forest", "island", "swamp", "plains"]
 
-                        # 2. Process Land vs Spell using GameEngine
-                        if is_land:
-                            success = self.engine.play_land(current_pid, card_id)
-                            if not success:
-                                self.send_pdu_verbose(sock, {
-                                    "type": "ERROR",
-                                    "seq_num": self.get_next_seq(),
-                                    "code": "ILLEGAL_ACTION",
-                                    "message": f"Cannot play land '{card_id}' (not in hand or land already played this turn)."
-                                })
-                                self.grant_priority(current_pid)
-                                continue
-                        else:
-                            success = self.engine.cast_spell(current_pid, card_id)
-                            if not success:
-                                self.send_pdu_verbose(sock, {
-                                    "type": "ERROR",
-                                    "seq_num": self.get_next_seq(),
-                                    "code": "ILLEGAL_ACTION",
-                                    "message": f"Cannot cast spell '{card_id}' (not in hand)."
-                                })
-                                self.grant_priority(current_pid)
-                                continue
+                        success = self.engine.cast_spell(current_pid, card_id)
+                        if not success:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"Cannot cast spell '{card_id}' (not in hand)."
+                            })
+                            self.grant_priority(current_pid)
+                            continue
 
-                        # 3. Broadcast updated game state and pass priority back
+                        print(f"[SERVER] {current_pid} cast spell '{card_id}' successfully.")
+
+                        # 2. Broadcast updated game state and pass priority back
                         self.consecutive_passes = 0
+                        for p in self.players:
+                            self.send_game_state_update(p)
+
+                        opponent_pid = next(p for p in self.game_state["life_totals"].keys() if p != current_pid)
+
+                        self.grant_priority(opponent_pid)
+
+                    elif pdu_type == "TAP_LAND":
+
+                        if current_pid != self.game_state["active_player"]:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "STALE_ACTION",
+                                "message": f"Priority token mismatch. Expected {self.current_priority_seq}, got {client_seq}.",
+                                "rejected_action": pdu
+                            })
+                            continue
+
+                        card_id = pdu.get("card_id")
+                        success = self.engine.tap_land_for_mana(current_pid, card_id)
+
+                        if not success:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": f"Cannot tap land '{card_id}' (not on battlefield or already tapped)."
+                            })
+                            self.grant_priority(current_pid)
+                            continue
+
+                        # Broadcast updated game state and pass priority back
                         for p in self.players:
                             self.send_game_state_update(p)
                         self.grant_priority(current_pid)
@@ -900,6 +1087,40 @@ class GameEngine:
 
         return True
 
+    def tap_land_for_mana(self, player_id, land_card_id):
+        """Taps a land on the battlefield to add mana to the player's mana pool."""
+        battlefield = self.game_state["battlefield"][player_id]
+
+        # Find the land on the battlefield
+        land = next((perm for perm in battlefield if perm["card"] == land_card_id), None)
+
+        if land is None:
+            return False  # Land not found
+
+        if land.get("tapped", False):
+            return False  # Land is already tapped
+
+        # Tap the land
+        land["tapped"] = True
+
+        # Determine mana type based on land type
+        base_card_name = "_".join(land_card_id.split("_")[:-1]) if land_card_id else ""
+        mana_type = {
+            "mountain": "R",
+            "forest": "G",
+            "island": "U",
+            "swamp": "B",
+            "plains": "W"
+        }.get(base_card_name)
+
+        if not mana_type:
+            return False  # Not a recognized basic land
+        
+        # Add mana to the player's mana pool
+        self.game_state["mana_pool"][player_id][mana_type] += 1
+
+        return True
+
     # cast a spell from the player's hand to the stack
     def cast_spell(self, player_id, card_id):
 
@@ -908,7 +1129,36 @@ class GameEngine:
 
         # check if the card is in the player's hand
         if card_id not in hand:
+            print(f"[GAME ENGINE] Player {player_id} attempted to cast card that is not in their hand.")
             return False
+
+        base_card_name = "_".join(card_id.split("_")[:-1]) if card_id else ""
+
+        card = self.card_catalog.get(base_card_name, {})
+
+        if not card:
+            print(f"[GAME ENGINE] Card not found in catalog.")
+            return False  # Card not found in catalog
+
+        mana_cost = card.get("CMC", 0) # Assuming CMC is stored as an integer in the card catalog
+
+        # Check if the player has enough mana in their mana pool to cast the spell
+        total_mana_available = sum(self.game_state["mana_pool"][player_id].values())
+        if total_mana_available < mana_cost:
+            print(f"[GAME ENGINE] Player {player_id} does not have enough mana to cast '{card_id}'. Required: {mana_cost}, Available: {total_mana_available}")
+            return False  # Not enough mana to cast the spell
+
+        # Spend mana
+        # Spend mana
+        mana_pool = self.game_state["mana_pool"][player_id]
+        for color in ["W", "U", "B", "R", "G"]:
+            if mana_cost <= 0:
+                break
+            available = mana_pool.get(color, 0)
+            if available > 0:
+                spent = min(available, mana_cost)
+                mana_pool[color] -= spent
+                mana_cost -= spent
 
         # remove from hand and add to stack
         hand.remove(card_id)
@@ -919,6 +1169,8 @@ class GameEngine:
 
             "card": card_id
         })
+
+        print(f"[GAME ENGINE] Player {player_id} cast '{card_id}' and added it to the stack.")
 
         return True
 
@@ -947,6 +1199,13 @@ class GameEngine:
         opponent = next((p for p in all_pids if p != controller), None)
 
         print(f"[GAME ENGINE] Resolving '{card_id}' cast by {controller}...")
+
+        card = self.card_catalog.get(base_card_name, {})
+        if card.get("type", "").upper() == "CREATURE":
+            # Move creature to battlefield
+            self.resolve_creature(top_item)
+            print(f"[GAME ENGINE] Creature '{card_id}' resolved and placed onto the battlefield for {controller}.")
+            return top_item
 
         # --- CARD RESOLUTION EFFECTS ---
         
@@ -995,6 +1254,10 @@ class GameEngine:
         for permanent in battlefield:
             if isinstance(permanent, dict):
                 permanent["tapped"] = False
+
+                if permanent.get("summoning_sickness", False):
+                    permanent["summoning_sickness"] = False
+                    
         print(f"[GAME ENGINE] Untap step completed for {player_id}. All permanents untapped.")
 
     def resolve_creature(self, stack_item):
@@ -1310,6 +1573,17 @@ class GameEngine:
         self.game_state["combat"]["damage_order"] = {}
 
         return result
+
+    def cleanup_step(self, player_id):
+        """Handles the cleanup step for the all players."""
+        for player in self.game_state["life_totals"].keys():
+            battlefield = self.game_state["battlefield"][player]
+            for perm in battlefield:
+                if perm.get("damage", 0) > 0:
+                    perm["damage"] = 0
+                if perm.get("summoning_sickness"):
+                    perm["summoning_sickness"] = False
+        print(f"[GAME ENGINE] Cleanup step completed for {player_id}. Summoning sickness removed from creatures. Damage cleared.")
     
 
 if __name__ == "__main__":
