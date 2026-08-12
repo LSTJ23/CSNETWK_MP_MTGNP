@@ -249,6 +249,13 @@ class MTGNPServer:
             "deck_list": deck_list
         }
 
+        self.send_pdu_verbose(sock, {
+            "type": "PLAYER_READY_ACK",
+            "seq_num": self.get_next_seq(),
+            "player_id": player_id,
+            "status": "ACCEPTED"
+        })
+
         ready_count = len(self.ready_players)
         waiting_for = []
         if ready_count < 2:
@@ -305,8 +312,7 @@ class MTGNPServer:
                 "attackers": [],
                 "blockers": {},
                 "damage_order": []
-            },
-            "mana_pool": {p1_id: {"R": 0, "G": 0, "U": 0, "B": 0, "W": 0}, p2_id: {"R": 0, "G": 0, "U": 0, "B": 0, "W": 0}}
+            }
         }
         self.engine.game_state = self.game_state
 
@@ -418,9 +424,8 @@ class MTGNPServer:
         
         self.broadcast({
             "type": "PHASE_TRANSITION",
-            "seq_num": self.get_next_seq(),
-            "from_phase": "MULLIGAN",
-            "to_phase": "UNTAP",
+            "phase": "UNTAP",
+            "step": "NONE",
             "active_player": self.game_state["active_player"],
             "turn": self.game_state["turn"]
         })
@@ -451,6 +456,7 @@ class MTGNPServer:
             "state": {
                 "turn": self.game_state["turn"],
                 "phase": self.game_state["phase"],
+                "step": self.game_state.get("step", "NONE"),
                 "active_player": self.game_state["active_player"],
                 "life_totals": self.game_state["life_totals"],
                 "hand": self.game_state["hands"].get(pid, []),
@@ -516,122 +522,152 @@ class MTGNPServer:
             winner = next(p["id"] for p in self.players if p["id"] != timed_out_player_id)
             self.trigger_game_over(winner, "DISCONNECT")
 
-    def transition_phase(self, new_phase: str, new_step: str):
+    def transition_phase(self, new_phase: str, new_step: str, priority_player=None):
+        """Transition the authoritative game state and notify clients.
+
+        priority_player lets combat hand priority to the correct player
+        (e.g. the non-active player for DECLARE_BLOCKERS).
+        """
+        old_phase = self.game_state.get("phase", "NONE")
+        old_step = self.game_state.get("step", "NONE")
+
         self.game_state["phase"] = new_phase
         self.game_state["step"] = new_step
         self.consecutive_passes = 0
-        
-        for p in self.players:
-            self.send_game_state_update(p)
-        
+
         self.broadcast({
             "type": "PHASE_TRANSITION",
-            "phase": new_phase,
-            "step": new_step
-        })
-        self.grant_priority(self.game_state["active_player"])
-
-    def advance_phase(self):
-        """ Move the game to the next phase/step in the PHASE_SEQUENCES list. """
-
-        current_phase = self.game_state["phase"]
-
-        try: 
-            current_index = PHASE_SEQUENCES.index(current_phase)
-        except ValueError:
-            print(f"[SERVER] Current phase '{current_phase}' not in PHASE_SEQUENCES. Resetting to UNTAP.")
-            self.transition_phase("UNTAP", "NONE")
-            return
-
-        if current_phase == "CLEANUP":
-            self.engine.cleanup_step(self.game_state["active_player"])
-            next_phase = "UNTAP"
-            all_pids = list(self.game_state["life_totals"].keys())
-
-            current_player = self.game_state["active_player"]
-            next_player = next((p for p in all_pids if p != current_player), current_player)
-
-            self.game_state["active_player"] = next_player
-            self.game_state["turn"] += 1
-
-            self.game_state["land_cast_on_turn"] = False
-
-            self.game_state["combat"]["attackers"].clear()
-            self.game_state["combat"]["blockers"].clear()
-            self.game_state["combat"]["damage_order"].clear()
-
-            self.broadcast({
-                "type": "PHASE_TRANSITION",
-                "seq_num": self.get_next_seq(),
-                "from_phase": "CLEANUP",
-                "to_phase": "UNTAP",
-                "active_player": next_player,
-                "turn": self.game_state["turn"]
-            })            
-
-            print(f"[SERVER] Turn {self.game_state['turn']} begins. Active player: {next_player}.")
-            self.transition_phase(next_phase, "NONE")
-            self.game_state["active_player"] = next_player
-
-            self.engine.untap_step(next_player)
-
-            return
-
-        next_phase = PHASE_SEQUENCES[current_index + 1]
-
-        print(f"[SERVER] Transitioning from {current_phase} to {next_phase}.")
-        self.transition_phase(next_phase, "NONE")
-
-        if next_phase == "UNTAP":
-            self.engine.untap_step(self.game_state["active_player"])
-
-        if next_phase == "DRAW":
-            if self.game_state["turn"] == 1:
-                print(f"[SERVER] Turn 1: Active player is {self.game_state['active_player']}, skipping draw step for first turn.")
-
-            else:
-                success = self.engine.draw_step(self.game_state["active_player"])
-
-                if not success:
-                    winner = next(p for p in self.game_state["life_totals"].keys() if p != self.game_state["active_player"])
-                    self.trigger_game_over(winner, "DECKOUT")
-                    print(f"[SERVER] Player {self.game_state['active_player']} attempted to draw from an empty library. {winner} wins by deckout.")
-                    return
-
-                else:
-                    print(f"[SERVER] Player {self.game_state['active_player']} drew a card successfully.")
-
-                for p in self.players:
-                    self.send_game_state_update(p)
-
-    def resolve_combat_damage_and_continue(self):
-        print(f"[SERVER] Resolving combat damage for {self.game_state['active_player']}.")
-
-        result = self.engine.resolve_combat_damage(self.game_state["active_player"])
-
-        if result is False:
-            print(f"[SERVER] Combat damage resolution failed for {self.game_state['active_player']}.")
-            return
-
-        self.broadcast({
-            "type": "COMBAT_DAMAGE_RESOLVED",
             "seq_num": self.get_next_seq(),
-            "active_player": self.game_state["active_player"],
-            "damage_events": result.get("damage_events", []),
-            "life_totals": result.get("life_totals", {}),
-            "creatures_died": result.get("creatures_died", []),
+            "from_phase": old_step if old_phase == "COMBAT" else old_phase,
+            "to_phase": new_step if new_phase == "COMBAT" else new_phase,
+            "phase": new_phase,
+            "step": new_step,
+            "active_player": self.game_state.get("active_player"),
+            "turn": self.game_state.get("turn", 0)
         })
-
-        if result.get("loser") != None:
-            winner = next(p for p in self.game_state["life_totals"].keys() if p != result["loser"])
-            self.trigger_game_over(winner, "LIFE_ZERO")
-            print(f"[SERVER] Player {result['loser']} lost all life during combat damage. Game over.")
-            return
 
         for p in self.players:
             self.send_game_state_update(p)
 
-        self.transition_phase("END_OF_COMBAT", "NONE")
+        # Some steps are automatic and must not receive priority.
+        if new_phase == "CLEANUP":
+            self.perform_cleanup_and_start_next_turn()
+            return
+
+        if priority_player is None:
+            priority_player = self.game_state["active_player"]
+
+        self.grant_priority(priority_player)
+
+    def get_next_player(self, player_id):
+        """Return the other player in this two-player implementation."""
+        all_pids = [r["player_id"] for r in self.ready_players.values()]
+        return next((p for p in all_pids if p != player_id), None)
+
+    def advance_after_passes(self):
+        """Advance the game after both players pass with an empty stack."""
+        phase = self.game_state.get("phase")
+        step = self.game_state.get("step", "NONE")
+        active = self.game_state["active_player"]
+
+        # Combat uses COMBAT as the phase and step as the sub-state.
+        if phase == "COMBAT":
+            if step == "BEGIN_COMBAT":
+                self.transition_phase("COMBAT", "DECLARE_ATTACKERS", active)
+                return
+
+            if step == "END_OF_COMBAT":
+                self.transition_phase("POSTCOMBAT_MAIN", "NONE", active)
+                return
+
+            # DECLARE_ATTACKERS/BLOCKERS/ASSIGN_DAMAGE_ORDER are action-driven
+            # and should not reach this method normally.
+            return
+
+        if phase == "UPKEEP":
+            self.transition_phase("DRAW", "NONE", active)
+            if not self.engine.draw_card(active):
+                winner = self.get_next_player(active)
+                self.trigger_game_over(winner, "DECK_EMPTY")
+                return
+            for p in self.players:
+                self.send_game_state_update(p)
+            self.grant_priority(active)
+            return
+
+        if phase == "DRAW":
+            self.transition_phase("PRECOMBAT_MAIN", "NONE", active)
+            return
+
+        if phase == "PRECOMBAT_MAIN":
+            self.transition_phase("COMBAT", "BEGIN_COMBAT", active)
+            return
+
+        if phase == "POSTCOMBAT_MAIN":
+            self.transition_phase("END_STEP", "NONE", active)
+            return
+
+        if phase == "END_STEP":
+            self.transition_phase("CLEANUP", "NONE", active)
+            return
+
+        print(f"[SERVER] No pass-transition rule for {phase}/{step}")
+
+    def resolve_combat_damage_and_continue(self):
+        """Resolve combat damage automatically and advance to End of Combat."""
+        print("[SERVER] Resolving combat damage...")
+
+        result = self.engine.resolve_combat_damage()
+        if result is False:
+            print("[SERVER] Combat damage resolution failed.")
+            return
+
+        self.broadcast({
+            "type": "COMBAT_DAMAGE_RESULT",
+            "seq_num": self.get_next_seq(),
+            "damage_events": result.get("damage_events", []),
+            "life_totals": result.get("life_totals", {}),
+            "creatures_died": result.get("creatures_died", [])
+        })
+
+        for p in self.players:
+            self.send_game_state_update(p)
+
+        loser = result.get("loser")
+        if loser is not None:
+            winner = self.get_next_player(loser)
+            self.trigger_game_over(winner or "UNKNOWN", "LIFE_ZERO")
+            return
+
+        self.transition_phase(
+            "COMBAT",
+            "END_OF_COMBAT",
+            self.game_state["active_player"]
+        )
+
+    def perform_cleanup_and_start_next_turn(self):
+        """Cleanup is automatic: clear damage, reset turn flags, then untap next turn."""
+        active = self.game_state["active_player"]
+        self.engine.cleanup_step()
+
+        next_player = self.get_next_player(active)
+        if next_player is None:
+            self.trigger_game_over("UNKNOWN", "INVALID_GAME_STATE")
+            return
+
+        self.game_state["active_player"] = next_player
+        self.game_state["turn"] = self.game_state.get("turn", 1) + 1
+        self.game_state["land_cast_on_turn"] = False
+        self.game_state["combat"] = {
+            "attackers": [],
+            "blockers": {},
+            "damage_order": {}
+        }
+
+        self.transition_phase("UNTAP", "NONE", next_player)
+        self.engine.untap_step(next_player)
+        for p in self.players:
+            self.send_game_state_update(p)
 
     def trigger_game_over(self, winner_id: str, reason: str):
         with self.lock:
@@ -726,70 +762,9 @@ class MTGNPServer:
                     continue
 
                 if pdu_type == "PLAY_LAND":
+                    pdu = {**pdu, "type": "CAST_SPELL"}
+                    pdu_type = "CAST_SPELL"
 
-                    if current_pid != self.current_priority_player or client_seq != self.current_priority_seq:
-                        try:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "STALE_ACTION",
-                                "message": f"Priority token mismatch. Expected {self.current_priority_seq}, got {client_seq}.",
-                                "rejected_action": pdu
-                            })
-                        except ConnectionResetError:
-                            pass
-
-                    card_id = pdu.get("card_id")
-
-                    if not card_id:
-                        try:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "ILLEGAL_ACTION",
-                                "message": f"PLAY_LAND PDU must include 'card_id'."
-                            })
-                        except ConnectionResetError:
-                            pass
-                        continue
-
-                    if self.game_state["land_cast_on_turn"]:
-                        try:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "ILLEGAL_ACTION",
-                                "message": f"Land has already been played this turn."
-                            })
-                        except ConnectionResetError:
-                            pass
-                        continue
-
-                    
-                    success = self.engine.play_land(current_pid, card_id)
-
-                    if not success:
-                        try:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "ILLEGAL_ACTION",
-                                "message": f"Cannot play land '{card_id}' (not in hand or land already played this turn)."
-                            })
-                        except ConnectionResetError:
-                            pass
-
-                    print(f"[SERVER] {current_pid} played land '{card_id}' successfully.")
-
-                    for p in self.players:
-                        self.send_game_state_update(p)
-
-                    self.game_state["land_cast_on_turn"] = True
-                    self.consecutive_passes = 0
-
-                    self.grant_priority(current_pid)
-                    continue
-                
                 if pdu_type == "MULLIGAN_CHOICE":
                     with self.lock:
                         self.handle_mulligan_choice(player_info, pdu)
@@ -835,174 +810,202 @@ class MTGNPServer:
 
                     if pdu_type == "PRIORITY_PASS":
                         self.consecutive_passes += 1
-                        
+
                         if self.consecutive_passes >= 2:
                             self.consecutive_passes = 0
-                            
-                            # 1. If stack has spells, resolve the top item first
+
+                            # Passing with a non-empty stack resolves the top
+                            # object, then the active player receives priority.
                             if self.game_state["stack"]:
                                 resolved_item = self.engine.resolve_stack()
                                 print(f"[SERVER] Resolved stack object: {resolved_item}")
-                                
+
                                 for p in self.players:
                                     self.send_game_state_update(p)
-                                
+
                                 self.grant_priority(self.game_state["active_player"])
                             else:
-                                # 2. If stack is empty, transition to COMBAT
-                                self.advance_phase()
+                                self.advance_after_passes()
                         else:
-                            all_pids = [r["player_id"] for r in self.ready_players.values()]
-                            next_player = next(p for p in all_pids if p != current_pid)
-                            self.grant_priority(next_player)
+                            next_player = self.get_next_player(current_pid)
+                            if next_player:
+                                self.grant_priority(next_player)
 
                     elif pdu_type == "CAST_SPELL":
-
-                        if current_pid != self.game_state["active_player"]:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "STALE_ACTION",
-                                "message": f"Active player cannot cast spells when not active.",
-                                "rejected_action": pdu
-                            })
-                            continue
-
                         card_id = pdu.get("card_id")
+                        
+                        # 1. Determine if card is a Land or Spell
+                        base_card_name = "_".join(card_id.split("_")[:-1]) if card_id else ""
+                        card_info = self.base_cards.get(base_card_name, {})
+                        card_type = str(card_info.get("type", "")).upper()
+                        
+                        is_land = card_type == "LAND" or base_card_name in ["mountain", "forest", "island", "swamp", "plains"]
 
-                        success = self.engine.cast_spell(current_pid, card_id)
-                        if not success:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "ILLEGAL_ACTION",
-                                "message": f"Cannot cast spell '{card_id}' (not in hand)."
-                            })
-                            self.grant_priority(current_pid)
-                            continue
+                        # 2. Process Land vs Spell using GameEngine
+                        if is_land:
+                            success = self.engine.play_land(current_pid, card_id)
+                            if not success:
+                                self.send_pdu_verbose(sock, {
+                                    "type": "ERROR",
+                                    "seq_num": self.get_next_seq(),
+                                    "code": "ILLEGAL_ACTION",
+                                    "message": f"Cannot play land '{card_id}' (not in hand or land already played this turn)."
+                                })
+                                self.grant_priority(current_pid)
+                                continue
+                        else:
+                            success = self.engine.cast_spell(current_pid, card_id)
+                            if not success:
+                                self.send_pdu_verbose(sock, {
+                                    "type": "ERROR",
+                                    "seq_num": self.get_next_seq(),
+                                    "code": "ILLEGAL_ACTION",
+                                    "message": f"Cannot cast spell '{card_id}' (not in hand)."
+                                })
+                                self.grant_priority(current_pid)
+                                continue
 
-                        print(f"[SERVER] {current_pid} cast spell '{card_id}' successfully.")
-
-                        # 2. Broadcast updated game state and pass priority back
+                        # 3. Broadcast updated game state and pass priority back
                         self.consecutive_passes = 0
-                        for p in self.players:
-                            self.send_game_state_update(p)
-
-                        opponent_pid = next(p for p in self.game_state["life_totals"].keys() if p != current_pid)
-
-                        self.grant_priority(opponent_pid)
-
-                    elif pdu_type == "TAP_LAND":
-
-                        if current_pid != self.game_state["active_player"]:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "STALE_ACTION",
-                                "message": f"Priority token mismatch. Expected {self.current_priority_seq}, got {client_seq}.",
-                                "rejected_action": pdu
-                            })
-                            continue
-
-                        card_id = pdu.get("card_id")
-                        success = self.engine.tap_land_for_mana(current_pid, card_id)
-
-                        if not success:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "ILLEGAL_ACTION",
-                                "message": f"Cannot tap land '{card_id}' (not on battlefield or already tapped)."
-                            })
-                            self.grant_priority(current_pid)
-                            continue
-
-                        # Broadcast updated game state and pass priority back
                         for p in self.players:
                             self.send_game_state_update(p)
                         self.grant_priority(current_pid)
 
                     elif pdu_type == "DECLARE_ATTACKERS":
-                        attackers_ids = [
-                            attacker.get("card_id") for attacker in pdu.get("attackers", [])
-                        ]
+                        raw_attackers = pdu.get("attackers", [])
+                        attackers_ids = []
+
+                        for attacker in raw_attackers:
+                            if isinstance(attacker, dict):
+                                card_id = attacker.get("card_id") or attacker.get("creature_id")
+                            else:
+                                card_id = attacker
+                            if card_id:
+                                attackers_ids.append(card_id)
 
                         success = self.engine.declare_attackers(current_pid, attackers_ids)
-
                         if not success:
                             self.send_pdu_verbose(sock, {
                                 "type": "ERROR",
                                 "seq_num": self.get_next_seq(),
                                 "code": "ILLEGAL_ACTION",
-                                "message": f"Invalid attackers declaration",
+                                "message": "Invalid attackers declaration"
                             })
                             self.grant_priority(current_pid)
                             continue
 
                         self.game_state["combat"]["attackers"] = attackers_ids
 
-                        # Broadcast updated game state and transition to DECLARE_BLOCKERS
                         for p in self.players:
                             self.send_game_state_update(p)
 
-                        self.grant_priority(current_pid)
-                        self.transition_phase("DECLARE_BLOCKERS", "DECLARE_BLOCKERS")
+                        # No attackers means no blockers and no damage step.
+                        if not attackers_ids:
+                            self.transition_phase(
+                                "COMBAT",
+                                "END_OF_COMBAT",
+                                self.game_state["active_player"]
+                            )
+                            continue
+
+                        defending_player = self.get_next_player(
+                            self.game_state["active_player"]
+                        )
+                        self.transition_phase(
+                            "COMBAT",
+                            "DECLARE_BLOCKERS",
+                            defending_player
+                        )
 
                     elif pdu_type == "DECLARE_BLOCKERS":
-
                         if current_pid == self.game_state["active_player"]:
                             self.send_pdu_verbose(sock, {
                                 "type": "ERROR",
                                 "seq_num": self.get_next_seq(),
                                 "code": "ILLEGAL_ACTION",
-                                "message": f"Active player cannot declare blockers.",
-                            })
-                            continue
-
-                        blockers_dict = pdu.get("blockers", {})
-                        success = self.engine.declare_blockers(current_pid, blockers_dict)
-
-                        if not success:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "ILLEGAL_ACTION",
-                                "message": f"Invalid blockers declaration",
+                                "message": "Active player cannot declare blockers."
                             })
                             self.grant_priority(current_pid)
                             continue
 
-                        self.game_state["combat"]["blockers"] = blockers_dict
+                        blockers = pdu.get("blockers", [])
+                        if isinstance(blockers, dict):
+                            # Accept the old mapping form if a client still uses it.
+                            normalized = []
+                            for attacker_id, blocker_ids in blockers.items():
+                                if isinstance(blocker_ids, str):
+                                    blocker_ids = [blocker_ids]
+                                for blocker_id in blocker_ids:
+                                    normalized.append({
+                                        "blocker": blocker_id,
+                                        "attacker": attacker_id
+                                    })
+                            blockers = normalized
 
-                        # Broadcast updated game state and transition to COMBAT_DAMAGE
+                        success = self.engine.declare_blockers(current_pid, blockers)
+                        if not success:
+                            self.send_pdu_verbose(sock, {
+                                "type": "ERROR",
+                                "seq_num": self.get_next_seq(),
+                                "code": "ILLEGAL_ACTION",
+                                "message": "Invalid blockers declaration"
+                            })
+                            self.grant_priority(current_pid)
+                            continue
+
+                        self.game_state["combat"]["blockers"] = {
+                            current_pid: blockers
+                        }
+
                         for p in self.players:
                             self.send_game_state_update(p)
 
-                        self.grant_priority(current_pid)
-                        self.transition_phase("ASSIGN_DAMAGE_ORDER", "ASSIGN_DAMAGE_ORDER")
+                        needs_damage_order = any(
+                            sum(1 for b in blockers if b.get("attacker") == attacker_id) > 1
+                            for attacker_id in self.game_state["combat"]["attackers"]
+                        )
+
+                        if needs_damage_order:
+                            self.transition_phase(
+                                "COMBAT",
+                                "ASSIGN_DAMAGE_ORDER",
+                                self.game_state["active_player"]
+                            )
+                        else:
+                            self.transition_phase(
+                                "COMBAT",
+                                "COMBAT_DAMAGE",
+                                self.game_state["active_player"]
+                            )
+                            self.resolve_combat_damage_and_continue()
 
                     elif pdu_type == "ASSIGN_DAMAGE_ORDER":
-                        damage_order = pdu.get("damage_order", [])
-                        success = self.engine.assign_damage_order(current_pid, damage_order)
+                        damage_order = pdu.get("damage_order", {})
+                        success = self.engine.assign_damage_order(
+                            current_pid, damage_order
+                        )
 
                         if not success:
                             self.send_pdu_verbose(sock, {
                                 "type": "ERROR",
                                 "seq_num": self.get_next_seq(),
                                 "code": "ILLEGAL_ACTION",
-                                "message": f"Invalid damage assignment order.",
+                                "message": "Invalid damage assignment order."
                             })
                             self.grant_priority(current_pid)
                             continue
 
                         self.game_state["combat"]["damage_order"] = damage_order
 
-                        # Broadcast updated game state and transition to COMBAT_DAMAGE
                         for p in self.players:
                             self.send_game_state_update(p)
 
-                        self.grant_priority(current_pid)
-                        self.resolve_combat_damage_and_continue() # resolve combat damage
+                        self.transition_phase(
+                            "COMBAT",
+                            "COMBAT_DAMAGE",
+                            self.game_state["active_player"]
+                        )
+                        self.resolve_combat_damage_and_continue()
 
         finally:
             # Always clean up player state upon thread exit
@@ -1094,40 +1097,6 @@ class GameEngine:
 
         return True
 
-    def tap_land_for_mana(self, player_id, land_card_id):
-        """Taps a land on the battlefield to add mana to the player's mana pool."""
-        battlefield = self.game_state["battlefield"][player_id]
-
-        # Find the land on the battlefield
-        land = next((perm for perm in battlefield if perm["card"] == land_card_id), None)
-
-        if land is None:
-            return False  # Land not found
-
-        if land.get("tapped", False):
-            return False  # Land is already tapped
-
-        # Tap the land
-        land["tapped"] = True
-
-        # Determine mana type based on land type
-        base_card_name = "_".join(land_card_id.split("_")[:-1]) if land_card_id else ""
-        mana_type = {
-            "mountain": "R",
-            "forest": "G",
-            "island": "U",
-            "swamp": "B",
-            "plains": "W"
-        }.get(base_card_name)
-
-        if not mana_type:
-            return False  # Not a recognized basic land
-        
-        # Add mana to the player's mana pool
-        self.game_state["mana_pool"][player_id][mana_type] += 1
-
-        return True
-
     # cast a spell from the player's hand to the stack
     def cast_spell(self, player_id, card_id):
 
@@ -1136,36 +1105,7 @@ class GameEngine:
 
         # check if the card is in the player's hand
         if card_id not in hand:
-            print(f"[GAME ENGINE] Player {player_id} attempted to cast card that is not in their hand.")
             return False
-
-        base_card_name = "_".join(card_id.split("_")[:-1]) if card_id else ""
-
-        card = self.card_catalog.get(base_card_name, {})
-
-        if not card:
-            print(f"[GAME ENGINE] Card not found in catalog.")
-            return False  # Card not found in catalog
-
-        mana_cost = card.get("CMC", 0) # Assuming CMC is stored as an integer in the card catalog
-
-        # Check if the player has enough mana in their mana pool to cast the spell
-        total_mana_available = sum(self.game_state["mana_pool"][player_id].values())
-        if total_mana_available < mana_cost:
-            print(f"[GAME ENGINE] Player {player_id} does not have enough mana to cast '{card_id}'. Required: {mana_cost}, Available: {total_mana_available}")
-            return False  # Not enough mana to cast the spell
-
-        # Spend mana
-        # Spend mana
-        mana_pool = self.game_state["mana_pool"][player_id]
-        for color in ["W", "U", "B", "R", "G"]:
-            if mana_cost <= 0:
-                break
-            available = mana_pool.get(color, 0)
-            if available > 0:
-                spent = min(available, mana_cost)
-                mana_pool[color] -= spent
-                mana_cost -= spent
 
         # remove from hand and add to stack
         hand.remove(card_id)
@@ -1176,8 +1116,6 @@ class GameEngine:
 
             "card": card_id
         })
-
-        print(f"[GAME ENGINE] Player {player_id} cast '{card_id}' and added it to the stack.")
 
         return True
 
@@ -1206,13 +1144,6 @@ class GameEngine:
         opponent = next((p for p in all_pids if p != controller), None)
 
         print(f"[GAME ENGINE] Resolving '{card_id}' cast by {controller}...")
-
-        card = self.card_catalog.get(base_card_name, {})
-        if card.get("type", "").upper() == "CREATURE":
-            # Move creature to battlefield
-            self.resolve_creature(top_item)
-            print(f"[GAME ENGINE] Creature '{card_id}' resolved and placed onto the battlefield for {controller}.")
-            return top_item
 
         # --- CARD RESOLUTION EFFECTS ---
         
@@ -1261,11 +1192,17 @@ class GameEngine:
         for permanent in battlefield:
             if isinstance(permanent, dict):
                 permanent["tapped"] = False
-
-                if permanent.get("summoning_sickness", False):
+                if "summoning_sickness" in permanent:
                     permanent["summoning_sickness"] = False
-
         print(f"[GAME ENGINE] Untap step completed for {player_id}. All permanents untapped.")
+
+    def cleanup_step(self):
+        """Remove marked damage at the end of the turn."""
+        for battlefield in self.game_state["battlefield"].values():
+            for permanent in battlefield:
+                if isinstance(permanent, dict) and "damage" in permanent:
+                    permanent["damage"] = 0
+        print("[GAME ENGINE] Cleanup step completed. Damage cleared.")
 
     def resolve_creature(self, stack_item):
         """Resolves a creature spell from the stack and places it onto the battlefield."""
@@ -1392,26 +1329,33 @@ class GameEngine:
             print(f"[GAME ENGINE] No blockers declared by {defending_player}. Cannot assign damage order.")
             return True
 
-        damage_order = {}
+        # Accept {attacker_id: [blocker_id, ...]} as the canonical order.
+        if not isinstance(damage_order, dict):
+            print("[GAME ENGINE] Damage order must be a mapping of attacker to blocker order.")
+            return False
 
+        actual_by_attacker = {}
         for declaration in blockers:
-
             attacker_card = declaration.get("attacker")
             blocker_card = declaration.get("blocker")
-
             if attacker_card is None or blocker_card is None:
-                print(f"[GAME ENGINE] Invalid blocker declaration: {declaration}")
                 return False
+            actual_by_attacker.setdefault(attacker_card, []).append(blocker_card)
 
-            # Get the list of blockers assigned to this attacker
-            actual_blockers = [b["blocker"] for b in blockers if b["attacker"] == attacker_card]
+        for attacker_card, actual_blockers in actual_by_attacker.items():
+            submitted = damage_order.get(attacker_card, [])
+            if not isinstance(submitted, list):
+                return False
+            if len(actual_blockers) > 1 and submitted != actual_blockers:
+                if set(submitted) != set(actual_blockers):
+                    print(
+                        f"[GAME ENGINE] Invalid damage order for {attacker_card}: "
+                        f"expected blockers {actual_blockers}, got {submitted}"
+                    )
+                    return False
 
-            # Make sure the submitted blockers are exactly the same as the actual blockers for this attacker
-            # if set(blocker_card.get(attacker_card, [])) != set(actual_blockers):
-            #     print(f"[GAME ENGINE] Damage order mismatch for attacker '{attacker_card}'. Expected blockers: {actual_blockers}, got: {blocker_card.get(attacker_card, [])}")
-            #     return Falser
-            # blockers.get() returns a list of blockers for the given attacker, or an empty list if none exist
-            damage_order[attacker_card] = blockers.get(attacker_card, []) + [blocker_card]
+            if len(submitted) != len(actual_blockers) or set(submitted) != set(actual_blockers):
+                return False
 
         # attackers_with_multiple_blockers = [attacker for attacker, assigned_blockers in damage_order.items() if len(assigned_blockers) > 1]
 
@@ -1451,7 +1395,7 @@ class GameEngine:
 
             power = attacker_card.get("power", 0)
 
-            assigned_blockers = [b["blocker"] for b in blockers if b["attacker"] == attacker_card]
+            assigned_blockers = [b["blocker"] for b in blockers if b["attacker"] == attacker_card["card"]]
 
             # No blockers; damage goes to defending player
             if not assigned_blockers:
@@ -1465,7 +1409,7 @@ class GameEngine:
 
                 continue
             # With Blockers; damage is assigned to blockers in the specified order
-            ordered_blockers = damage_order.get(attacker_card, assigned_blockers)
+            ordered_blockers = damage_order.get(attacker_card["card"], assigned_blockers)
 
             remaining_power = power
 
@@ -1580,17 +1524,6 @@ class GameEngine:
         self.game_state["combat"]["damage_order"] = {}
 
         return result
-
-    def cleanup_step(self, player_id):
-        """Handles the cleanup step for the all players."""
-        for player in self.game_state["life_totals"].keys():
-            battlefield = self.game_state["battlefield"][player]
-            for perm in battlefield:
-                if perm.get("damage", 0) > 0:
-                    perm["damage"] = 0
-                if perm.get("summoning_sickness"):
-                    perm["summoning_sickness"] = False
-        print(f"[GAME ENGINE] Cleanup step completed for {player_id}. Summoning sickness removed from creatures. Damage cleared.")
     
 
 if __name__ == "__main__":

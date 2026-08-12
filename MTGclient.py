@@ -154,14 +154,27 @@ class MTGNPClient:
 
             elif msg_type == "PHASE_TRANSITION":
                 with self.lock:
-                    self.current_priority_seq = seq_num
+                    # PHASE_TRANSITION is informational. The following
+                    # PRIORITY_GRANT contains the action sequence number.
+                    self.has_priority = False
                     new_phase = pdu.get("phase")
                     new_step = pdu.get("step")
                     if new_phase:
                         self.visible_state["phase"] = new_phase
                     if new_step:
                         self.visible_state["step"] = new_step
+                    if "active_player" in pdu:
+                        self.visible_state["active_player"] = pdu["active_player"]
+                    if "turn" in pdu:
+                        self.visible_state["turn"] = pdu["turn"]
                 self.cleanprint(f"[PHASE] Transited to {pdu.get('phase')} - {pdu.get('step')}")
+
+            elif msg_type == "COMBAT_DAMAGE_RESULT":
+                self.cleanprint(
+                    f"[COMBAT DAMAGE] Events: {pdu.get('damage_events', [])} | "
+                    f"Life: {pdu.get('life_totals', {})} | "
+                    f"Died: {pdu.get('creatures_died', [])}"
+                )
 
             elif msg_type == "ERROR":
                 self.cleanprint(f"[SERVER REJECTION] {pdu.get('code')}: {pdu.get('message')}")
@@ -190,7 +203,7 @@ class MTGNPClient:
         self.cleanprint(
             f"\n{'=' * 50}\n"
             f"--- AUTHORITATIVE VISIBLE GAME STATE ---\n"
-            f"Turn: {self.visible_state.get('turn')} | Phase: {self.visible_state.get('phase')} | Active Player: {self.visible_state.get('active_player')}\n"
+            f"Turn: {self.visible_state.get('turn')} | Phase: {self.visible_state.get('phase')} | Step: {self.visible_state.get('step')} | Active Player: {self.visible_state.get('active_player')}\n"
             f"Life Totals: {self.visible_state.get('life_totals', {})}\n"
             f"Your Hand: {self.visible_state.get('hand', [])}\n"
             f"Opponent Hand Counts: {self.visible_state.get('hand_counts', {})}\n"
@@ -207,6 +220,7 @@ class MTGNPClient:
             return "yes | no | /exit"
 
         phase = self.visible_state.get("phase", "LOBBY")
+        step = self.visible_state.get("step", "NONE")
 
         if phase == "LOBBY":
             return "ready <player_id> [card1,card2,...] | /exit"
@@ -220,11 +234,14 @@ class MTGNPClient:
         if phase in ["PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"]:
             return "pass | cast <card_id> | play <card_id> | concede | /exit"
             
-        elif phase == "DECLARE_ATTACKERS":
+        elif step == "DECLARE_ATTACKERS":
             return "attack <card1,card2,...> | pass | concede | /exit"
             
-        elif phase == "DECLARE_BLOCKERS":
+        elif step == "DECLARE_BLOCKERS":
             return "block <blocker:attacker,...> | pass | concede | /exit"
+
+        elif step == "ASSIGN_DAMAGE_ORDER":
+            return "order <attacker>:<blocker1,blocker2,...> | pass | concede | /exit"
 
         return "pass | cast <card_id> | play <card_id> | concede | /exit"
 
@@ -355,20 +372,46 @@ class MTGNPClient:
                     self.send_action("PLAY_LAND", {"card_id": parts[1]})
                 elif action == "attack" and len(parts) > 1:
                     raw_cards = parts[1].translate(str.maketrans("", "", "[]\"'"))
-                    attackers_id = [c.strip() for c in raw_cards.split(",") if c.strip()]
-                    attackers = [{"card_id": c, "card": c} for c in attackers_id]
+                    attacker_ids = [c.strip() for c in raw_cards.split(",") if c.strip()]
+
+                    opponent = next(
+                        (p for p in self.visible_state.get("life_totals", {})
+                         if p != self.visible_state.get("active_player")),
+                        None
+                    )
+
+                    attackers = [
+                        {
+                            "card_id": card_id,
+                            "creature_id": card_id,
+                            "target": opponent
+                        }
+                        for card_id in attacker_ids
+                    ]
                     self.send_action("DECLARE_ATTACKERS", {"attackers": attackers})
                 elif action == "block" and len(parts) > 1:
-                    blockers = []
-                    declaration = parts[1].translate(str.maketrans("", "", "[]\"'"))
-                    for pair in declaration.split(","):
+                    declarations = []
+                    for pair in parts[1].split(","):
                         if ":" not in pair:
-                            print(f"Invalid block declaration: {pair}. Use format blocker:attacker.")
-                            continue
+                            print("Usage: block <blocker>:<attacker>,<blocker>:<attacker>")
+                            declarations = []
+                            break
                         blocker, attacker = pair.split(":", 1)
-                        blockers.append({"blocker": blocker.strip(), "attacker": attacker.strip()})
-
-                    self.send_action("DECLARE_BLOCKERS", {"blockers": blockers})
+                        declarations.append({
+                            "blocker": blocker.strip(),
+                            "attacker": attacker.strip()
+                        })
+                    self.send_action("DECLARE_BLOCKERS", {"blockers": declarations})
+                elif action == "order" and len(parts) > 1:
+                    damage_order = {}
+                    for group in parts[1].split(";"):
+                        if ":" not in group:
+                            continue
+                        attacker, blocker_list = group.split(":", 1)
+                        damage_order[attacker.strip()] = [
+                            b.strip() for b in blocker_list.split(",") if b.strip()
+                        ]
+                    self.send_action("ASSIGN_DAMAGE_ORDER", {"damage_order": damage_order})
                 elif action == "concede":
                     self.send_action("CONCEDE")
                 else:
