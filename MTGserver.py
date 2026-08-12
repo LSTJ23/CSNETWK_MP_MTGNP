@@ -9,6 +9,7 @@ import argparse
 
 from card_catalog import load_card_catalog
 
+# Global server network configurations and phase sequence definitions
 MAX_PDU_SIZE = 65535
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4444
@@ -20,6 +21,7 @@ PHASE_SEQUENCES = [
     "POSTCOMBAT_MAIN", "END_STEP", "CLEANUP"
 ]
 
+# Serializes JSON payload and prefixes with a 4-byte big-endian header for TCP stream transmission
 def send_pdu(sock: socket.socket, payload: dict) -> None:
     """Encodes JSON payload and prefixes it with a 4-byte big-endian header."""
     json_bytes = json.dumps(payload).encode('utf-8')
@@ -32,6 +34,7 @@ def send_pdu(sock: socket.socket, payload: dict) -> None:
     except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError) as e:
         raise ConnectionResetError(f"Connection aborted while sending: {e}")
 
+# Blocks until exact requested byte length is accumulated from TCP buffer
 def recv_exact(sock: socket.socket, length: int) -> bytes:
     """Reads exactly `length` bytes from a TCP socket."""
     buf = bytearray()
@@ -46,6 +49,7 @@ def recv_exact(sock: socket.socket, length: int) -> bytes:
         buf.extend(chunk)
     return bytes(buf)
 
+# Reads fixed 4-byte header to determine packet size and receives full JSON payload
 def recv_pdu(sock: socket.socket) -> dict:
     header = recv_exact(sock, 4)
     length = struct.unpack(">I", header)[0]
@@ -55,6 +59,7 @@ def recv_pdu(sock: socket.socket) -> dict:
     return json.loads(payload_bytes.decode('utf-8'))
 
 class MTGNPServer:
+    # Initializes server state, card catalog, thread locks, active sessions, and game engine
     def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, verbose: bool = False):
         self.host = host
         self.port = port
@@ -63,6 +68,7 @@ class MTGNPServer:
         self.seq_lock = threading.Lock()
         self.running = True
         
+        # Load external card catalog spreadsheet
         try:
             self.card_catalog, self.base_cards = load_card_catalog("mtgnp_master_card_list.xlsx")
             print(f"[SERVER] Loaded {len(self.card_catalog)} valid card instances and {len(self.base_cards)} base cards.")
@@ -85,14 +91,17 @@ class MTGNPServer:
         
         self.engine = GameEngine(self.game_state, self.base_cards)
 
+    # Output verbose debug messages to console
     def log_verbose(self, message: str):
         if self.verbose:
             print(f"\033[35m[VERBOSE SERVER]\033[0m {message}", flush=True)
 
+    # Sends PDU while simultaneously outputting packet info to debug log
     def send_pdu_verbose(self, sock: socket.socket, payload: dict):
         self.log_verbose(f"OUTGOING PDU: {json.dumps(payload)}")
         send_pdu(sock, payload)
 
+    # Validates submitted deck size (1-50 cards) and card legality against catalog
     def validate_deck(self, deck_list):
         """Validates deck size and card legality."""
         deck_size = len(deck_list)
@@ -106,6 +115,7 @@ class MTGNPServer:
                 
         return True, "Deck valid"
             
+    # Evaluates terminal match conditions (0 life or deck exhaustion)
     def check_win_conditions(self):
         """
         Checks game-ending conditions according to RFC rules:
@@ -134,6 +144,7 @@ class MTGNPServer:
 
         return False, None, ""         
 
+    # Restores server back to LOBBY status while keeping active TCP connections
     def reset_to_lobby(self):
         """Resets game state back to LOBBY while retaining TCP connections."""
         if self.priority_timer:
@@ -144,6 +155,7 @@ class MTGNPServer:
         self.consecutive_passes = 0
         print("[SERVER] Server returned to LOBBY state. Awaiting PLAYER_READY PDUs.")
 
+    # Re-initializes empty game state dictionary fields
     def reset_game_state(self):
         """Initializes or resets authoritative game state for a new match."""
         self.game_state = {
@@ -158,12 +170,14 @@ class MTGNPServer:
         if hasattr(self, 'engine'):
             self.engine.game_state = self.game_state
 
+    # Atomically increments and returns the next server sequence counter integer
     def get_next_seq(self) -> int:
         with self.seq_lock:
             seq = self.server_seq_num
             self.server_seq_num += 1
             return seq
 
+    # Opens TCP server socket on 0.0.0.0 and spawns thread handlers for incoming connections
     def start(self):
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -181,6 +195,7 @@ class MTGNPServer:
                 break
 
             with self.lock:
+                # Limit server capacity to two simultaneous client connections
                 if len(self.players) >= 2:
                     print(f"[SERVER] Connection attempt from {addr} rejected: Server full.", flush=True)
                     try:
@@ -197,6 +212,7 @@ class MTGNPServer:
                 t = threading.Thread(target=self.handle_client, args=(player_info,), daemon=True)
                 t.start()
 
+    # Validates readiness, unique player ID registration, and deck contents in LOBBY phase
     def handle_player_ready(self, player_info: dict, pdu: dict):
         """Validates deck size and player ID uniqueness before marking player ready."""
         sock = player_info["socket"]
@@ -214,6 +230,7 @@ class MTGNPServer:
             })
             return
 
+        # Ensure no duplicate player IDs between clients
         for existing_conn_id, ready_data in self.ready_players.items():
             if existing_conn_id != conn_id and ready_data["player_id"] == player_id:
                 self.send_pdu_verbose(sock, {
@@ -224,6 +241,7 @@ class MTGNPServer:
                 })
                 return
 
+        # Verify deck size bound constraints
         if len(deck_list) < 1 or len(deck_list) > 50:
             self.send_pdu_verbose(sock, {
                 "type": "ERROR",
@@ -233,6 +251,7 @@ class MTGNPServer:
             })
             return
 
+        # Check that each card ID exists in master catalog
         if self.card_catalog:
             invalid_cards = [card for card in deck_list if card not in self.card_catalog]
             if invalid_cards:
@@ -271,9 +290,11 @@ class MTGNPServer:
             }
         })
 
+        # Start game setup once both connected players have signaled ready status
         if ready_count == 2:
             self.execute_game_setup()
 
+    # Performs initial game setup: shuffles decks, draws opening hands, sets life to 20, chooses starting player
     def execute_game_setup(self):
         """Executes deck shuffling, card drawing, life initialization, and coin flip."""
         self.state = "GAME_SETUP"
@@ -288,6 +309,7 @@ class MTGNPServer:
         random.shuffle(p1_deck)
         random.shuffle(p2_deck)
 
+        # Slice 7 cards for initial hand and leave remaining in library
         p1_hand, p1_library = p1_deck[:7], p1_deck[7:]
         p2_hand, p2_library = p2_deck[:7], p2_deck[7:]
 
@@ -325,6 +347,7 @@ class MTGNPServer:
         for p in self.players:
             self.send_game_state_update(p)
     
+    # Processes keep/mulligan choices, sequence verification, redrawing, and placing cards on bottom of library
     def handle_mulligan_choice(self, player_info: dict, pdu: dict):
         sock = player_info["socket"]
         conn_id = player_info["id"]
@@ -344,6 +367,7 @@ class MTGNPServer:
             # Player already kept, ignore further mulligan choices
             return
 
+        # Enforce exact sequence tracking to reject stale inputs
         client_seq = pdu.get("seq_num")
         if client_seq != m_state.get("expected_seq"):
             self.send_pdu_verbose(sock, {
@@ -373,7 +397,7 @@ class MTGNPServer:
             print(f"[SERVER] {pid} took a mulligan. Mulligan count: {m_state['count']}")
             self.send_game_state_update(player_info)
         else:
-            # Keep hand: confirm bottomed cards
+            # Keep hand: confirm bottomed cards match expected mulligan penalty count
             if len(cards_to_bottom) != m_state["count"]:
                 self.send_pdu_verbose(sock, {
                     "type": "ERROR",
@@ -408,6 +432,7 @@ class MTGNPServer:
             if all(s["kept"] for s in self.mulligan_state.values()):
                 self.start_game_proper()
                 
+    # Completes mulligan phase, starts Turn 1 in UNTAP step, and advances to UPKEEP
     def start_game_proper(self):
         """Transitions from MULLIGAN to IN_GAME and starts the first turn."""
         self.state = "IN_GAME"
@@ -436,6 +461,7 @@ class MTGNPServer:
         # Transition immediately to Upkeep Step
         self.transition_phase("UPKEEP", "NONE")
 
+    # Prepares and sends personalized game state representations (hiding secret hand info)
     def send_game_state_update(self, player_info):
         """Formats personalized GAME_STATE_UPDATE per Section 6.3 schema."""
         conn_id = player_info["id"]
@@ -450,6 +476,7 @@ class MTGNPServer:
         if self.state == "MULLIGAN" and pid in self.mulligan_state:
             self.mulligan_state[pid]["expected_seq"] = current_seq
         
+        # Build state payload masking opponent hand contents
         state_pdu = {
             "type": "GAME_STATE_UPDATE",
             "seq_num": current_seq,
@@ -472,6 +499,7 @@ class MTGNPServer:
         except ConnectionResetError:
             print(f"[SERVER] Failed to send state update to {pid}: Connection aborted.")
 
+    # Sends identical broadcast PDU message to all currently connected client sockets
     def broadcast(self, pdu_template: dict):
         for p in self.players:
             pdu = dict(pdu_template)
@@ -481,6 +509,7 @@ class MTGNPServer:
             except Exception:
                 pass
 
+    # Issues PRIORITY_GRANT token to specified player and sets countdown timer thread
     def grant_priority(self, player_id: str, timeout_ms: int = DEFAULT_PRIORITY_TIMEOUT_MS):
         self.current_priority_player = player_id
         self.current_priority_seq = self.get_next_seq()
@@ -506,6 +535,7 @@ class MTGNPServer:
                 self.trigger_game_over(next((p for p in self.ready_players.values() if p["player_id"] != player_id), {}).get("player_id", "UNKNOWN"), "DISCONNECT")
                 return
 
+        # Restart priority turn timeout timer
         if self.priority_timer:
             self.priority_timer.cancel()
         
@@ -516,12 +546,14 @@ class MTGNPServer:
         )
         self.priority_timer.start()
 
+    # Callback executed when a player fails to respond before priority timeout expires
     def handle_priority_timeout(self, timed_out_player_id: str):
         with self.lock:
             print(f"[SERVER] Priority timeout by {timed_out_player_id}.")
             winner = next(p["id"] for p in self.players if p["id"] != timed_out_player_id)
             self.trigger_game_over(winner, "DISCONNECT")
 
+    # Updates current phase/step in state machine, broadcasts transition, and grants priority
     def transition_phase(self, new_phase: str, new_step: str, priority_player=None):
         """Transition the authoritative game state and notify clients.
 
@@ -559,11 +591,13 @@ class MTGNPServer:
 
         self.grant_priority(priority_player)
 
+    # Identifies the opponent's player_id relative to given player_id
     def get_next_player(self, player_id):
         """Return the other player in this two-player implementation."""
         all_pids = [r["player_id"] for r in self.ready_players.values()]
         return next((p for p in all_pids if p != player_id), None)
 
+    # Advances turn phase machine state after consecutive priority passes from both players
     def advance_after_passes(self):
         """Advance the game after both players pass with an empty stack."""
         phase = self.game_state.get("phase")
@@ -613,6 +647,7 @@ class MTGNPServer:
 
         print(f"[SERVER] No pass-transition rule for {phase}/{step}")
 
+    # Invokes engine damage resolution logic, checks for fatal damage, and moves to end of combat
     def resolve_combat_damage_and_continue(self):
         """Resolve combat damage automatically and advance to End of Combat."""
         print("[SERVER] Resolving combat damage...")
@@ -645,6 +680,7 @@ class MTGNPServer:
             self.game_state["active_player"]
         )
 
+    # Automates turn cleanup: resets temporary combat damage, toggles turn counter, shifts active player
     def perform_cleanup_and_start_next_turn(self):
         """Cleanup is automatic: clear damage, reset turn flags, then untap next turn."""
         active = self.game_state["active_player"]
@@ -669,6 +705,7 @@ class MTGNPServer:
         for p in self.players:
             self.send_game_state_update(p)
 
+    # Terminates game session, cancels timers, declares winner/reason, and triggers rematch voting
     def trigger_game_over(self, winner_id: str, reason: str):
         with self.lock:
             if self.state == "GAME_OVER":
@@ -691,6 +728,7 @@ class MTGNPServer:
                 "message": "Game over! Would you like to play a rematch? (yes/no)"
             })
 
+    # Records and aggregates rematch preferences from both clients
     def handle_rematch_response(self, player_id: str, accepted: bool):
         with self.lock:
             if self.state != "GAME_OVER":
@@ -699,6 +737,7 @@ class MTGNPServer:
             self.rematch_votes[player_id] = accepted
             print(f"[SERVER] Rematch vote from {player_id}: {'Accepted' if accepted else 'Declined'}")
 
+            # Check if both connected players responded or if any declined
             if len(self.rematch_votes) == 2 or not accepted:
                 both_agreed = len(self.rematch_votes) == 2 and all(self.rematch_votes.values())
                 
@@ -713,6 +752,7 @@ class MTGNPServer:
                 else:
                     self.close_server()
 
+    # Terminates all client socket connections and shuts down server process
     def close_server(self):
         with self.lock:
             for p in self.players:
@@ -723,6 +763,7 @@ class MTGNPServer:
             self.players.clear()
             sys.exit(0)
 
+    # Main thread worker receiving client network PDUs and processing game requests
     def handle_client(self, player_info: dict):
         sock = player_info["socket"]
         pid = player_info["id"]
@@ -746,6 +787,7 @@ class MTGNPServer:
                 pdu_type = pdu.get("type")
                 client_seq = pdu.get("seq_num")
 
+                # Parse lobby initialization
                 if pdu_type == "PLAYER_READY":
                     if self.state != "LOBBY":
                         try:
@@ -761,6 +803,7 @@ class MTGNPServer:
                         self.handle_player_ready(player_info, pdu)
                     continue
 
+                # Map land placement action to spell casting flow internally
                 if pdu_type == "PLAY_LAND":
                     pdu = {**pdu, "type": "CAST_SPELL"}
                     pdu_type = "CAST_SPELL"
@@ -770,6 +813,7 @@ class MTGNPServer:
                         self.handle_mulligan_choice(player_info, pdu)
                     continue
                 
+                # Echo ping requests back as pong responses
                 if pdu_type == "PING":
                     try:
                         self.send_pdu_verbose(sock, {"type": "PONG", "seq_num": client_seq})
@@ -790,6 +834,7 @@ class MTGNPServer:
 
                 with self.lock:
                     current_pid = self.ready_players.get(pid, {}).get("player_id")
+                    # Validate sequence and priority token validity before applying game actions
                     if current_pid != self.current_priority_player or client_seq != self.current_priority_seq:
                         try:
                             self.send_pdu_verbose(sock, {
@@ -805,9 +850,11 @@ class MTGNPServer:
                             self.grant_priority(current_pid)
                         continue
 
+                    # Cancel timer upon receiving valid prioritized action
                     if self.priority_timer:
                         self.priority_timer.cancel()
 
+                    # Handle passing priority between players
                     if pdu_type == "PRIORITY_PASS":
                         self.consecutive_passes += 1
 
@@ -831,6 +878,7 @@ class MTGNPServer:
                             if next_player:
                                 self.grant_priority(next_player)
 
+                    # Handle playing lands and casting spells
                     elif pdu_type == "CAST_SPELL":
                         card_id = pdu.get("card_id")
                         
@@ -871,6 +919,7 @@ class MTGNPServer:
                             self.send_game_state_update(p)
                         self.grant_priority(current_pid)
 
+                    # Handle attacker declaration phase inputs
                     elif pdu_type == "DECLARE_ATTACKERS":
                         raw_attackers = pdu.get("attackers", [])
                         attackers_ids = []
@@ -917,6 +966,7 @@ class MTGNPServer:
                             defending_player
                         )
 
+                    # Handle blocker declaration phase inputs
                     elif pdu_type == "DECLARE_BLOCKERS":
                         if current_pid == self.game_state["active_player"]:
                             self.send_pdu_verbose(sock, {
@@ -979,6 +1029,7 @@ class MTGNPServer:
                             )
                             self.resolve_combat_damage_and_continue()
 
+                    # Handle damage assignment ordering for multiple blockers
                     elif pdu_type == "ASSIGN_DAMAGE_ORDER":
                         damage_order = pdu.get("damage_order", {})
                         success = self.engine.assign_damage_order(
@@ -1186,6 +1237,7 @@ class GameEngine:
 
         return top_item
 
+    # Untaps all permanents and resets summoning sickness flags for active player
     def untap_step(self, player_id):
         """Handles the untap step for the given player."""
         battlefield = self.game_state["battlefield"][player_id]
@@ -1196,6 +1248,7 @@ class GameEngine:
                     permanent["summoning_sickness"] = False
         print(f"[GAME ENGINE] Untap step completed for {player_id}. All permanents untapped.")
 
+    # Resets accumulated damage on all battlefield permanents to zero at turn end
     def cleanup_step(self):
         """Remove marked damage at the end of the turn."""
         for battlefield in self.game_state["battlefield"].values():
@@ -1204,6 +1257,7 @@ class GameEngine:
                     permanent["damage"] = 0
         print("[GAME ENGINE] Cleanup step completed. Damage cleared.")
 
+    # Resolves creature spell off stack and enters it onto battlefield with summoning sickness
     def resolve_creature(self, stack_item):
         """Resolves a creature spell from the stack and places it onto the battlefield."""
 
@@ -1227,6 +1281,7 @@ class GameEngine:
 
         return True
 
+    # Validates and records declared attacking creatures, marking them tapped
     def declare_attackers(self, player_id, attackers):
         """Handles the declaration of attackers for the given player."""
 
@@ -1257,6 +1312,7 @@ class GameEngine:
         print(f"[GAME ENGINE] {player_id} declared attackers: {[perm['card'] for perm in valid_attackers]}")
         return True
 
+    # Validates and records declared blocking creatures against specified attackers
     def declare_blockers(self, player_id, blockers):
         """Handles the declaration of blockers for the given player."""
 
@@ -1303,6 +1359,7 @@ class GameEngine:
 
         return True
 
+    # Validates damage ordering for attacking creatures blocked by multiple creatures
     def assign_damage_order(self, player_id, damage_order):
         """Handles the assignment of damage order for the given player."""
 
@@ -1342,6 +1399,7 @@ class GameEngine:
                 return False
             actual_by_attacker.setdefault(attacker_card, []).append(blocker_card)
 
+        # Validate that the submitted damage ordering contains all assigned blockers for every attacker
         for attacker_card, actual_blockers in actual_by_attacker.items():
             submitted = damage_order.get(attacker_card, [])
             if not isinstance(submitted, list):
@@ -1372,6 +1430,7 @@ class GameEngine:
 
         return True
 
+    # Computes combat damage distribution, applies lethal damage, kills creatures, and updates life totals
     def resolve_combat_damage(self):
         """Resolves combat damage based on declared attackers, blockers, and assigned damage order."""
 
@@ -1424,6 +1483,7 @@ class GameEngine:
                 blocker_toughness = blocker.get("toughness", 0)
                 blocker_damage = blocker.get("damage", 0)
 
+                # Calculate remaining health on blocker before lethal damage is reached
                 lethal_damage = max(0, blocker_toughness - blocker_damage)
 
                 damage_to_block = min(remaining_power, lethal_damage)
@@ -1491,6 +1551,7 @@ class GameEngine:
                 damage = perm.get("damage", 0)
                 toughness = perm.get("toughness", 0)
 
+                # Move to graveyard if accumulated damage meets or exceeds toughness
                 if damage >= toughness:
                     creatures_to_remove.append((player_id, card_name))
                     graveyard.append(card_name)

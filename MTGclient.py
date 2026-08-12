@@ -7,21 +7,29 @@ import time
 import os
 import argparse
 
+# Global constants for packet framing, server defaults, and heartbeat timing
 MAX_PDU_SIZE = 65535
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 4444
 PING_INTERVAL_SEC = 30.0
 PONG_TIMEOUT_SEC = 10.0
 
+# Encodes a Python dictionary into JSON and sends it over TCP with a 4-byte big-endian length header
 def send_pdu(sock: socket.socket, payload: dict) -> None:
+    # Serialize dictionary payload to UTF-8 encoded bytes
     json_bytes = json.dumps(payload).encode('utf-8')
+    # Validate payload size against the maximum PDU protocol limit
     if len(json_bytes) > MAX_PDU_SIZE:
         raise ValueError(f"Payload size {len(json_bytes)} exceeds MAX_PDU_SIZE.")
+    # Pack payload length into a 4-byte unsigned integer (Big-Endian network byte order)
     header = struct.pack(">I", len(json_bytes))
+    # Send both header and body atomically over the socket stream
     sock.sendall(header + json_bytes)
 
+# Reads exact byte length from TCP socket to prevent incomplete packet reads
 def recv_exact(sock: socket.socket, length: int) -> bytes:
     buf = bytearray()
+    # Loop continuously until the entire requested byte count has been assembled
     while len(buf) < length:
         chunk = sock.recv(length - len(buf))
         if not chunk:
@@ -29,16 +37,22 @@ def recv_exact(sock: socket.socket, length: int) -> bytes:
         buf.extend(chunk)
     return bytes(buf)
 
+# Receives and parses a full PDU packet from the socket
 def recv_pdu(sock: socket.socket) -> dict:
+    # Read fixed 4-byte big-endian length header
     header = recv_exact(sock, 4)
     length = struct.unpack(">I", header)[0]
+    # Enforce packet size ceiling safety check
     if length > MAX_PDU_SIZE:
         raise ValueError(f"Received PDU header size {length} > MAX_PDU_SIZE.")
+    # Read the full payload based on parsed header length
     payload_bytes = recv_exact(sock, length)
+    # Decode raw UTF-8 bytes into JSON dict
     return json.loads(payload_bytes.decode('utf-8'))
 
 
 class MTGNPClient:
+    # Initializes client state, socket references, sequence numbers, and thread locks
     def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, verbose: bool = False):
         self.host = host
         self.port = port
@@ -46,6 +60,7 @@ class MTGNPClient:
         self.sock = None
         self.running = False
         
+        # Local view of authoritative game state
         self.visible_state = {}
         self.player_ready_seq = 1
         self.current_priority_seq = 0
@@ -53,14 +68,17 @@ class MTGNPClient:
         self.has_priority = False
         self.awaiting_rematch_decision = False
         
+        # Heartbeat tracking parameters
         self.ping_counter = 0
         self.awaiting_pong = False
         self.lock = threading.Lock()
 
+    # Outputs debug information if verbose flag is enabled
     def log_verbose(self, message: str):
         if self.verbose:
             print(f"\n\033[36m[VERBOSE CLIENT]\033[0m {message}", flush=True)
 
+    # Establishes TCP connection and launches receiver, heartbeat, and input threads
     def start(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -73,20 +91,25 @@ class MTGNPClient:
 
         self.running = True
 
+        # Spawn background listener thread to handle incoming server PDUs asynchronously
         receiver_thread = threading.Thread(target=self.listen_for_messages, daemon=True)
         receiver_thread.start()
 
+        # Spawn background heartbeat thread to send periodic PING messages
         ping_thread = threading.Thread(target=self.ping_heartbeat_loop, daemon=True)
         ping_thread.start()
 
+        # Hand over main thread to interactive command input loop
         self.user_input_loop()
 
+    # Thread worker that periodically sends PING PDUs and checks for PONG timeout
     def ping_heartbeat_loop(self):
         while self.running:
             time.sleep(PING_INTERVAL_SEC)
             if not self.running:
                 break
 
+            # Safely assemble and send ping payload under lock
             with self.lock:
                 self.ping_counter += 1
                 ping_pdu = {"type": "PING", "seq_num": self.ping_counter}
@@ -97,6 +120,7 @@ class MTGNPClient:
                 except Exception:
                     break
 
+            # Wait for PONG reply and monitor for timeout threshold
             send_time = time.time()
             while self.running and self.awaiting_pong:
                 if time.time() - send_time > PONG_TIMEOUT_SEC:
@@ -105,12 +129,13 @@ class MTGNPClient:
                     return
                 time.sleep(0.5)
 
-
+    # Helper function to clear active prompt line and display incoming server messages cleanly
     def cleanprint(self, message: str):
         # Clears the active prompt line, prints the server message, and restores '> '.
         print(f"\r\033[K{message}\n"
               f"[Valid Commands: {self.get_available_commands()}]\n\n> ", end="", flush=True)
 
+    # Worker thread listening for incoming network packets and dispatching based on PDU type
     def listen_for_messages(self):
         while self.running:
             try:
@@ -130,10 +155,12 @@ class MTGNPClient:
                 if msg_type != "PONG":
                     self.last_server_seq = seq_num
 
+            # Handle heartbeats
             if msg_type == "PONG":
                 with self.lock:
                     self.awaiting_pong = False
 
+            # Update local game state mirror
             elif msg_type == "GAME_STATE_UPDATE":
                 with self.lock:
                     state_data = pdu.get("state", {})
@@ -146,12 +173,14 @@ class MTGNPClient:
                             self.current_priority_seq = seq_num
                         self.render_visible_state()
 
+            # Handle explicit priority grants from server
             elif msg_type == "PRIORITY_GRANT":
                 with self.lock:
                     self.current_priority_seq = seq_num
                     self.has_priority = True
                 self.cleanprint(f">>> Priority Granted! [{seq_num}]")
 
+            # Update phase/step metadata upon transition notification
             elif msg_type == "PHASE_TRANSITION":
                 with self.lock:
                     # PHASE_TRANSITION is informational. The following
@@ -169,6 +198,7 @@ class MTGNPClient:
                         self.visible_state["turn"] = pdu["turn"]
                 self.cleanprint(f"[PHASE] Transited to {pdu.get('phase')} - {pdu.get('step')}")
 
+            # Display combat results
             elif msg_type == "COMBAT_DAMAGE_RESULT":
                 self.cleanprint(
                     f"[COMBAT DAMAGE] Events: {pdu.get('damage_events', [])} | "
@@ -176,16 +206,20 @@ class MTGNPClient:
                     f"Died: {pdu.get('creatures_died', [])}"
                 )
 
+            # Display rejection errors from server
             elif msg_type == "ERROR":
                 self.cleanprint(f"[SERVER REJECTION] {pdu.get('code')}: {pdu.get('message')}")
 
+            # Display game over banner
             elif msg_type == "GAME_OVER":
                 print(f"[GAME OVER] Winner: {pdu.get('winner')} | Reason: {pdu.get('reason')}")
 
+            # Handle post-game rematch requests
             elif msg_type == "REMATCH_REQUEST":
                 self.awaiting_rematch_decision = True
                 self.cleanprint(f"[REMATCH] {pdu.get('message')}")
 
+            # Handle rematch outcome voting
             elif msg_type == "REMATCH_RESULT":
                 accepted = pdu.get("accepted", False)
                 self.cleanprint(f"[REMATCH RESULT] {pdu.get('message')}")
@@ -199,6 +233,7 @@ class MTGNPClient:
                     self.shutdown()
                     break
 
+    # Renders structured display of current authoritative game state to stdout
     def render_visible_state(self):
         self.cleanprint(
             f"\n{'=' * 50}\n"
@@ -214,6 +249,7 @@ class MTGNPClient:
             f"{'=' * 50}"
         )
 
+    # Returns contextual list of commands available based on current phase and priority state
     def get_available_commands(self) -> str:
         """Returns valid commands based on current state and phase."""
         if self.awaiting_rematch_decision:
@@ -245,6 +281,7 @@ class MTGNPClient:
 
         return "pass | cast <card_id> | play <card_id> | concede | /exit"
 
+    # Constructs and transmits PLAYER_READY PDU containing player ID and chosen deck
     def send_player_ready(self, player_id: str, deck_list: list):
         pdu = {
             "type": "PLAYER_READY",
@@ -256,6 +293,7 @@ class MTGNPClient:
         self.log_verbose(f"OUTGOING PDU: {json.dumps(pdu)}")
         send_pdu(self.sock, pdu)
 
+    # Transmits general action PDU and releases local priority token
     def send_action(self, action_type: str, extra_fields: dict = None):
         pdu = {
             "type": action_type,
@@ -269,6 +307,7 @@ class MTGNPClient:
         with self.lock:
             self.has_priority = False
 
+    # Main user interactive loop parsing text commands from standard input
     def user_input_loop(self):
         while self.running:
             try:
@@ -311,6 +350,7 @@ class MTGNPClient:
                             continue
                         p_id = parts[1]
                         raw_cards = parts[2] if len(parts) > 2 else ""
+                        # Strip standard array delimiters and formatting chars from input string
                         clean_cards = raw_cards.translate(str.maketrans("", "", "[]\"'"))
                         cards = [c.strip() for c in clean_cards.split(",") if c.strip()]
                         self.send_player_ready(p_id, cards)
@@ -364,6 +404,7 @@ class MTGNPClient:
                 parts = cmd.split(maxsplit=1)
                 action = parts[0].lower()
 
+                # Parse specific combat or main phase user commands
                 if action == "pass":
                     self.send_action("PRIORITY_PASS")
                 elif action == "cast" and len(parts) > 1:
@@ -374,6 +415,7 @@ class MTGNPClient:
                     raw_cards = parts[1].translate(str.maketrans("", "", "[]\"'"))
                     attacker_ids = [c.strip() for c in raw_cards.split(",") if c.strip()]
 
+                    # Infer opponent ID for default targeting in attacker declaration payload
                     opponent = next(
                         (p for p in self.visible_state.get("life_totals", {})
                          if p != self.visible_state.get("active_player")),
@@ -391,6 +433,7 @@ class MTGNPClient:
                     self.send_action("DECLARE_ATTACKERS", {"attackers": attackers})
                 elif action == "block" and len(parts) > 1:
                     declarations = []
+                    # Parse blocker:attacker pairs
                     for pair in parts[1].split(","):
                         if ":" not in pair:
                             print("Usage: block <blocker>:<attacker>,<blocker>:<attacker>")
@@ -404,6 +447,7 @@ class MTGNPClient:
                     self.send_action("DECLARE_BLOCKERS", {"blockers": declarations})
                 elif action == "order" and len(parts) > 1:
                     damage_order = {}
+                    # Parse attacker:blocker1,blocker2 damage assignment sequences
                     for group in parts[1].split(";"):
                         if ":" not in group:
                             continue
@@ -422,6 +466,7 @@ class MTGNPClient:
 
         self.shutdown()
 
+    # Stops client process, releases socket connection, and exits system thread
     def shutdown(self):
         self.running = False
         if self.sock:
