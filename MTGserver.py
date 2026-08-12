@@ -738,19 +738,6 @@ class MTGNPServer:
                             })
                         except ConnectionResetError:
                             pass
-        
-
-                    if self.game_state["phase"] not in ["PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"]:
-                        try:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "ILLEGAL_ACTION",
-                                "message": f"PLAY_LAND can only be performed during PRECOMBAT_MAIN or POSTCOMBAT_MAIN phases."
-                            })
-                        except ConnectionResetError:
-                            pass
-                        continue
 
                     card_id = pdu.get("card_id")
 
@@ -878,15 +865,6 @@ class MTGNPServer:
                                 "code": "STALE_ACTION",
                                 "message": f"Active player cannot cast spells when not active.",
                                 "rejected_action": pdu
-                            })
-                            continue
-
-                        if self.game_state["phase"] not in ["PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"]:
-                            self.send_pdu_verbose(sock, {
-                                "type": "ERROR",
-                                "seq_num": self.get_next_seq(),
-                                "code": "ILLEGAL_ACTION",
-                                "message": f"CAST_SPELL can only be performed during PRECOMBAT_MAIN or POSTCOMBAT_MAIN phases."
                             })
                             continue
 
