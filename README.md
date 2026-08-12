@@ -41,7 +41,7 @@ python MTGserver.py --verbose
 | --- | --- | --- | --- | --- |
 | **TCP Server** (connection handling, framing, dispatch)  | Implemented connection between server and clients | — | — | — |
 | **Game Lifecycle** (LOBBY, GAME_SETUP, MULLIGAN)         | Implemented general code for Lobby and Game Setup | — | — | Implemented Mulligan logic |
-| **Turn & Phase Engine** (transitions, steps)             | — | — | — | Implemented game transitions |
+| **Turn & Phase Engine** (transitions, steps)             | — | Implemented transitions for combat | — | Implemented game transitions |
 | **Priority & Stack Logic** (resolution)                  | — | — | Implemented stack resolution | — |
 | **Combat System** (attackers, blockers, damage)          | — | Implemented major combat mechanics | Implemented combat phase logic | — |
 | **Client Implementation** (state rendering, commands)    | — | — | Implemented client-side command updates | — |
